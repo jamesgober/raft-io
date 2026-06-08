@@ -328,7 +328,18 @@ fn decode(data: &[u8]) -> Result<Decoded> {
         TAG_SNAPSHOT => {
             let index = read_u64(data, rest_at)?;
             let term = read_u64(data, rest_at + 8)?;
-            let config_count = read_u64(data, rest_at + 16)? as usize;
+            let config_count = read_u64(data, rest_at + 16)?;
+            // Bound the count to the bytes actually present before allocating, so
+            // a corrupt or hostile length cannot trigger a giant allocation. Each
+            // member is 8 bytes, and at least the trailing data length must follow.
+            let max_members = (data.len().saturating_sub(rest_at + 24) / 8) as u64;
+            if config_count > max_members {
+                return Err(Error::storage(
+                    "decode durable log record",
+                    "snapshot configuration length exceeds record",
+                ));
+            }
+            let config_count = config_count as usize;
             let mut config = Vec::with_capacity(config_count);
             let mut off = rest_at + 24;
             for _ in 0..config_count {
@@ -382,9 +393,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_snapshot_record_hostile_config_length_is_rejected() {
+        // A snapshot record claiming a huge member count must be rejected, not
+        // turned into a giant `Vec::with_capacity` that aborts the process.
+        let mut bad = vec![TAG_SNAPSHOT];
+        bad.extend_from_slice(&5u64.to_le_bytes()); // index
+        bad.extend_from_slice(&2u64.to_le_bytes()); // term
+        bad.extend_from_slice(&u64::MAX.to_le_bytes()); // config_count: hostile
+        assert!(decode(&bad).is_err());
+    }
+
     proptest::proptest! {
         /// Fuzz the WAL record decoder: arbitrary bytes must yield `Ok` or `Err`,
-        /// never a panic, so a corrupt or truncated record cannot crash recovery.
+        /// never a panic or an unbounded allocation, so a corrupt or hostile
+        /// record cannot crash recovery.
         #[test]
         fn wal_decode_never_panics(
             bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512)

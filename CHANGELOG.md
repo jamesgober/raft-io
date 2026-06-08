@@ -47,6 +47,14 @@ wire and WAL formats are frozen as of this release and will not break before 2.0
   enums and tagged encodings. Cross-platform verification of the persistent path
   runs on the Linux/macOS/Windows CI matrix.
 
+### Security
+
+- The `WalLog` snapshot-record decoder now bounds the declared configuration
+  length against the bytes actually present before allocating, rejecting a
+  corrupt or hostile record instead of attempting a multi-exabyte
+  `Vec::with_capacity` that would abort the process. Surfaced by the new decode
+  fuzzing.
+
 ---
 
 ## [0.6.0] - 2026-06-08
