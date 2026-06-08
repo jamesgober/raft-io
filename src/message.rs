@@ -112,16 +112,27 @@ pub struct AppendEntries {
 ///
 /// `success` is `true` when the follower's log matched at `prev_log_index` and
 /// it accepted the RPC. `match_index` reports the highest log index the
-/// follower now agrees on, which the leader uses to track replication progress
-/// (from `v0.3`).
+/// follower now agrees on, which the leader uses to track replication progress.
+///
+/// On a rejection, the `conflict_*` fields let the leader skip the follower's
+/// `next_index` back by a whole term in one round trip instead of decrementing
+/// one entry at a time (the fast-backtracking optimisation from the Raft thesis,
+/// §5.3). They are `0` on success and ignored.
 ///
 /// # Examples
 ///
 /// ```
 /// use raft_io::AppendEntriesReply;
 ///
-/// let reply = AppendEntriesReply { term: 4, success: true, from: 2, match_index: 9 };
-/// assert!(reply.success);
+/// let ok = AppendEntriesReply {
+///     term: 4,
+///     success: true,
+///     from: 2,
+///     match_index: 9,
+///     conflict_index: 0,
+///     conflict_term: 0,
+/// };
+/// assert!(ok.success);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppendEntriesReply {
@@ -133,6 +144,13 @@ pub struct AppendEntriesReply {
     pub from: NodeId,
     /// Highest log index the follower now matches with the leader.
     pub match_index: Index,
+    /// On rejection, the index the leader should probe next (the follower's
+    /// first index of `conflict_term`, or its log length plus one when the log
+    /// is simply too short). `0` on success.
+    pub conflict_index: Index,
+    /// On rejection, the term of the follower's entry at `prev_log_index`, or
+    /// `0` when the follower has no entry there. `0` on success.
+    pub conflict_term: Term,
 }
 
 /// Any message a node can send or receive.
@@ -188,6 +206,8 @@ impl Message {
     ///     success: false,
     ///     from: 2,
     ///     match_index: 0,
+    ///     conflict_index: 1,
+    ///     conflict_term: 0,
     /// });
     /// assert_eq!(m.term(), 5);
     /// ```
@@ -246,6 +266,8 @@ mod tests {
                 success: true,
                 from: 1,
                 match_index: 0,
+                conflict_index: 0,
+                conflict_term: 0,
             })
             .term(),
             4

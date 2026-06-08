@@ -41,11 +41,11 @@
 
 <h2>What it does</h2>
 
-- **Leader election** &mdash; randomized-timeout election with term and vote safety; one leader per term _(live in v0.2)_
-- **Deterministic core** &mdash; the state machine is pure and step-driven, so the whole protocol is testable without time or I/O _(live in v0.2)_
-- **Pluggable transport** &mdash; `RaftTransport` trait; in-memory for tests, real net for production _(live in v0.2)_
-- **Pluggable log store** &mdash; `RaftLog` trait; `wal-db`-backed under the `persistence` feature _(trait in v0.2; durable backend in v0.4)_
-- **Log replication** &mdash; append-entries pipeline with batching and flow control _(v0.3)_
+- **Leader election** &mdash; randomized-timeout election with term and vote safety; one leader per term _(live)_
+- **Log replication** &mdash; batched append-entries with per-follower progress, optimistic pipelining, conflict-hint backtracking, and commit on a quorum _(live in v0.3)_
+- **Deterministic core** &mdash; the state machine is pure and step-driven, so the whole protocol is testable without time or I/O _(live)_
+- **Pluggable transport** &mdash; `RaftTransport` trait; in-memory for tests, real net for production _(live)_
+- **Pluggable log store** &mdash; `RaftLog` trait; `wal-db`-backed under the `persistence` feature _(trait live; durable backend in v0.4)_
 - **Snapshotting** &mdash; install-snapshot for log compaction and fast follower catch-up _(v0.5)_
 - **Membership changes** &mdash; single-server add/remove via joint-consensus-safe reconfiguration _(v0.6)_
 
@@ -56,7 +56,7 @@
 
 ```toml
 [dependencies]
-raft-io = "0.2"
+raft-io = "0.3"
 ```
 
 <br>
@@ -96,22 +96,26 @@ logical ticks. The protocol is sans-I/O — *when* to tick and *how* to deliver
 messages are yours to decide, which is what makes the whole thing testable
 without a clock or a network.
 
-Two runnable examples show both paths end to end:
+Runnable examples show each path end to end:
 
 ```bash
-cargo run --example single_node        # elect + propose + apply, one node
-cargo run --example in_memory_cluster  # a 3-node cluster electing a leader
+cargo run --example single_node         # elect + propose + apply, one node
+cargo run --example in_memory_cluster   # a 3-node cluster electing a leader
+cargo run --example replicated_log      # propose + replicate; all nodes agree
+cargo run --example partition_recovery  # minority stalls, majority commits, heal
 ```
 
 <br>
 
 ## Status
 
-This is `v0.2.0`: the deterministic protocol core. Leader election with full
-term and vote safety, the leader heartbeat, and single-node commit all work
-end to end over the in-memory drivers, and Election Safety is checked by a
-property-test suite. Multi-node log replication lands in `v0.3`, durable
-persistence (`wal-db`) in `v0.4`, and snapshots in `v0.5`, per the
+This is `v0.3.0`: a correct multi-node cluster. On top of v0.2's election layer,
+the full log-replication pipeline is implemented — batched `AppendEntries`,
+per-follower progress with optimistic pipelining, conflict-hint backtracking, and
+commit on a quorum (current-term rule). An adversarial property-test suite drives
+3- and 5-node clusters through reordered, dropped, duplicated, and partitioned
+message schedules and asserts that committed entries never diverge. Durable
+persistence (`wal-db`) lands in `v0.4` and snapshots in `v0.5`, per the
 <a href="./.dev/ROADMAP.md"><code>ROADMAP</code></a> (development copy). The full
 public surface is documented in <a href="./docs/API.md"><code>docs/API.md</code></a>.
 

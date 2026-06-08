@@ -16,7 +16,7 @@
 
 > Complete reference for every public item in `raft-io`, with examples.
 >
-> **Status: pre-1.0 (`v0.2`).** This document tracks the API surface as it lands
+> **Status: pre-1.0 (`v0.3`).** This document tracks the API surface as it lands
 > across the 0.x series. The wire protocol and trait seams are frozen at `1.0`.
 > Sections marked _(planned: vX.Y)_ describe a surface a later phase introduces.
 
@@ -52,9 +52,11 @@ storage are injected through the [`RaftLog`](#raftlog) and
 [`RaftTransport`](#rafttransport) seams. That separation is what makes the core
 provable — an entire run is reproducible from a seed and a sequence of events.
 
-At `v0.2` the implemented surface is leader election with full term and vote
-safety, the leader heartbeat, and single-node commit. Multi-node log
-replication is `v0.3`, durable persistence `v0.4`, and snapshots `v0.5`.
+At `v0.3` the implemented surface is leader election with full term and vote
+safety plus the complete multi-node log-replication pipeline: batched
+[`AppendEntries`](#appendentries), per-follower progress with optimistic
+pipelining, conflict-hint backtracking, and commit on a quorum. Durable
+persistence is `v0.4` and snapshots are `v0.5`.
 
 ---
 
@@ -62,7 +64,7 @@ replication is `v0.3`, durable persistence `v0.4`, and snapshots `v0.5`.
 
 ```toml
 [dependencies]
-raft-io = "0.2"
+raft-io = "0.3"
 ```
 
 MSRV: Rust 1.85 (edition 2024).
@@ -85,11 +87,13 @@ assert!(actions.iter().any(|a| matches!(a, Action::Apply { .. })));
 assert_eq!(node.commit_index(), 1);
 ```
 
-Two runnable examples cover both paths end to end:
+Runnable examples cover each path end to end:
 
 ```bash
-cargo run --example single_node        # elect + propose + apply, one node
-cargo run --example in_memory_cluster  # a 3-node cluster electing a leader
+cargo run --example single_node         # elect + propose + apply, one node
+cargo run --example in_memory_cluster   # a 3-node cluster electing a leader
+cargo run --example replicated_log      # propose + replicate; all nodes agree
+cargo run --example partition_recovery  # minority stalls, majority commits, heal
 ```
 
 ---
@@ -233,11 +237,12 @@ the caller decides how often to tick.
 |---|---|---|
 | <a id="with_election_timeout"></a>`with_election_timeout` | `fn with_election_timeout(self, min: u32, max: u32) -> Self` | Randomised election-timeout bounds, in ticks. The spread breaks split votes. Normalised so `min >= 1` and `max >= min`. |
 | <a id="with_heartbeat_interval"></a>`with_heartbeat_interval` | `fn with_heartbeat_interval(self, interval: u32) -> Self` | Ticks between leader heartbeats. Keep it well below the election-timeout minimum. Normalised to `>= 1`. |
+| <a id="with_max_batch"></a>`with_max_batch` | `fn with_max_batch(self, max_batch: usize) -> Self` | Maximum entries carried by one `AppendEntries`. Bounds message size and per-RPC work so a far-behind follower is caught up in steady chunks. Normalised to `>= 1`. Default `64`. |
 | <a id="with_seed"></a>`with_seed` | `fn with_seed(self, seed: u64) -> Self` | Seed for the deterministic election-timeout RNG. Give peers distinct seeds (the default is the node id). |
 
 **Accessors:** `id() -> NodeId`, `peers() -> &[NodeId]`,
 `election_timeout() -> (u32, u32)`, `heartbeat_interval() -> u32`,
-`seed() -> u64`.
+`max_batch() -> usize`, `seed() -> u64`.
 
 ```rust
 use raft_io::RaftConfig;
@@ -446,10 +451,11 @@ for action in node.step(Event::Propose(b"x".to_vec())).unwrap() {
 
 The RPCs nodes exchange. The protocol never sends these itself — it emits
 [`Action::Send`](#action) carrying a [`Message`](#message), and the caller
-delivers it through a [`RaftTransport`](#rafttransport). At `v0.2`
-[`AppendEntries`](#appendentries) is used only as an empty heartbeat; carrying
-entries (replication) is `v0.3`, and the fields are already present so the wire
-shape will not change.
+delivers it through a [`RaftTransport`](#rafttransport).
+[`AppendEntries`](#appendentries) carries log entries in bounded batches when a
+follower is behind and is an empty heartbeat when it is caught up; on rejection
+the reply carries a conflict hint so the leader can backtrack a whole term at a
+time.
 
 #### `Message`
 
@@ -474,6 +480,7 @@ use raft_io::{AppendEntriesReply, Message};
 
 let m = Message::AppendEntriesReply(AppendEntriesReply {
     term: 5, success: false, from: 2, match_index: 0,
+    conflict_index: 1, conflict_term: 0,
 });
 assert_eq!(m.term(), 5);
 ```
@@ -532,12 +539,18 @@ pub struct AppendEntriesReply {
     pub success: bool,
     pub from: NodeId,
     pub match_index: Index,
+    pub conflict_index: Index,
+    pub conflict_term: Term,
 }
 ```
 
 A follower's answer. `success` is `true` when the log matched at
 `prev_log_index`; `match_index` reports the highest index the follower now
-agrees on (used to track replication progress from `v0.3`).
+agrees on, which the leader uses to track replication progress. On a rejection
+the `conflict_index` / `conflict_term` pair lets the leader skip its
+`next_index` for this follower back by a whole term in one round trip instead of
+decrementing one entry at a time (the fast-backtracking optimisation). Both are
+`0` on success.
 
 ```rust
 use raft_io::{AppendEntries, Message};
@@ -564,6 +577,7 @@ pub trait RaftLog {
     fn last_term(&self) -> Term;
     fn term_at(&self, index: Index) -> Option<Term>;
     fn entry(&self, index: Index) -> Option<LogEntry>;
+    fn entries(&self, from: Index, to: Index) -> Vec<LogEntry>; // has a default impl
     fn append(&mut self, entries: &[LogEntry]) -> Result<()>;
     fn truncate(&mut self, from: Index) -> Result<()>;
     fn hard_state(&self) -> HardState;
@@ -578,6 +592,7 @@ pub trait RaftLog {
 | `last_term` | Term of the last entry, or `0` if empty. |
 | `term_at(index)` | Term at `index`; `Some(0)` for the sentinel `0`, `None` past the end. |
 | `entry(index)` | The entry at `index`, or `None`. |
+| `entries(from, to)` | Entries in the inclusive range `[from, to]` (the leader's replication batch). Has a default impl over `entry`; override for a bulk read. |
 | `append(entries)` | Append entries; the first index must be `last_index() + 1` and the batch contiguous. |
 | `truncate(from)` | Remove every entry with index `>= from` (`from >= 1`). |
 | `hard_state` | The persisted [`HardState`](#hardstate). |
@@ -715,7 +730,7 @@ signatures read `Result<T>`.
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| _(none yet)_ | — | The `v0.2` core has no feature flags. |
+| _(none yet)_ | — | The `v0.3` core has no feature flags. |
 
 Two flags are reserved for later phases and are not yet present on the crate,
 because an optional dependency without a code path that uses it would be dead

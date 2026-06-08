@@ -14,10 +14,12 @@
 //!
 //! ## Status
 //!
-//! This is the `v0.2` foundation: the deterministic core, leader election with
-//! term and vote safety, and single-node commit over the in-memory drivers.
-//! Multi-node log replication lands in `v0.3`, durable persistence (`wal-db`)
-//! in `v0.4`, and snapshots in `v0.5`. See `docs/API.md` for the full surface.
+//! This is `v0.3`: the deterministic core, leader election with term and vote
+//! safety, and the full multi-node log-replication pipeline — batched
+//! `AppendEntries`, per-follower progress tracking with optimistic pipelining,
+//! conflict-hint backtracking, and commit on a quorum. Durable persistence
+//! (`wal-db`) lands in `v0.4` and snapshots in `v0.5`. See `docs/API.md` for the
+//! full surface.
 //!
 //! ## The three tiers
 //!

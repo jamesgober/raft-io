@@ -19,6 +19,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.3.0] - 2026-06-08
+
+Log replication and a correct multi-node cluster. On top of v0.2's election
+layer, a leader now replicates its log to followers, tracks each one's progress,
+and advances the commit index once a quorum stores an entry — verified by an
+adversarial property-test suite that reorders, drops, duplicates, and partitions
+messages.
+
+### Added
+
+- Full `AppendEntries` replication: the leader carries log entries in bounded
+  batches (`RaftConfig::with_max_batch`, default 64), tracks per-follower
+  progress, and pipelines optimistically once a follower's match point is found.
+- Fast conflict-hint backtracking: a rejected append carries `conflict_index` /
+  `conflict_term` (new `AppendEntriesReply` fields) so the leader skips back a
+  whole term in one round trip instead of one entry at a time.
+- Commit on a quorum with Raft's current-term safety rule (§5.4.2): an entry is
+  committed by counting replicas only if it was created in the current term.
+- Followers reconcile divergent tails (truncate-then-append) and advance their
+  commit index from the leader, applying committed entries in log order.
+- `RaftConfig::with_max_batch` / `max_batch` — replication batch-size control.
+- `RaftLog::entries(from, to)` — bulk range read for assembling replication
+  batches (default implementation over `entry`; `MemoryLog` overrides with a
+  slice copy).
+- Adversarial `proptest` suite (`tests/replication.rs`): 3- and 5-node clusters
+  driven through reordered / dropped / duplicated / partitioned schedules,
+  asserting committed entries never diverge and applies stay in order. Plus
+  deterministic replication, partition, and heal tests.
+- Examples: `replicated_log` (propose and watch all nodes agree) and
+  `partition_recovery` (minority stalls, majority commits, heal reconciles).
+- `criterion` benchmark for the follower replication-receive path.
+
+### Changed
+
+- `AppendEntriesReply` gains `conflict_index` and `conflict_term` fields (the
+  backtracking hint). Pre-1.0 wire-shape change.
+
+---
+
 ## [0.2.0] - 2026-06-07
 
 The deterministic sans-I/O protocol core: leader election with full term and
@@ -78,6 +117,7 @@ Initial scaffold and repository bootstrap. No raft-io logic yet &mdash; this rel
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/raft-io/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/raft-io/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/raft-io/releases/tag/v0.1.0

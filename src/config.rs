@@ -23,6 +23,10 @@ const DEFAULT_ELECTION_MAX: u32 = 20;
 /// Default heartbeat interval, in ticks. Must be well below the election
 /// timeout so a healthy leader is never replaced.
 const DEFAULT_HEARTBEAT: u32 = 3;
+/// Default cap on entries carried by a single `AppendEntries`. Bounds message
+/// size and per-RPC work so a far-behind follower is caught up in steady chunks
+/// rather than one unbounded payload.
+const DEFAULT_MAX_BATCH: usize = 64;
 
 /// Configuration for a single [`RaftNode`](crate::RaftNode).
 ///
@@ -49,6 +53,7 @@ pub struct RaftConfig {
     pub(crate) election_timeout_min: u32,
     pub(crate) election_timeout_max: u32,
     pub(crate) heartbeat_interval: u32,
+    pub(crate) max_batch: usize,
     pub(crate) seed: u64,
 }
 
@@ -78,6 +83,7 @@ impl RaftConfig {
             election_timeout_min: DEFAULT_ELECTION_MIN,
             election_timeout_max: DEFAULT_ELECTION_MAX,
             heartbeat_interval: DEFAULT_HEARTBEAT,
+            max_batch: DEFAULT_MAX_BATCH,
             seed: id,
         }
     }
@@ -149,6 +155,27 @@ impl RaftConfig {
         self
     }
 
+    /// Sets the maximum number of log entries a single `AppendEntries` carries.
+    ///
+    /// This bounds message size and the work done per replication RPC: a
+    /// follower that has fallen far behind is caught up in batches of at most
+    /// this many entries rather than in one unbounded payload. The value is
+    /// normalised to at least `1` so replication can always make progress.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use raft_io::RaftConfig;
+    ///
+    /// let cfg = RaftConfig::new(1, [2, 3]).with_max_batch(256);
+    /// assert_eq!(cfg.max_batch(), 256);
+    /// ```
+    #[must_use]
+    pub fn with_max_batch(mut self, max_batch: usize) -> Self {
+        self.max_batch = max_batch.max(1);
+        self
+    }
+
     /// Sets the seed for the node's election-timeout RNG.
     ///
     /// Determinism is the point of the core, so the jitter source is seeded
@@ -198,6 +225,13 @@ impl RaftConfig {
         self.heartbeat_interval
     }
 
+    /// Returns the maximum entries carried by a single `AppendEntries`.
+    #[inline]
+    #[must_use]
+    pub fn max_batch(&self) -> usize {
+        self.max_batch
+    }
+
     /// Returns the election-timeout RNG seed.
     #[inline]
     #[must_use]
@@ -224,7 +258,14 @@ mod tests {
             (DEFAULT_ELECTION_MIN, DEFAULT_ELECTION_MAX)
         );
         assert_eq!(cfg.heartbeat_interval(), DEFAULT_HEARTBEAT);
+        assert_eq!(cfg.max_batch(), DEFAULT_MAX_BATCH);
         assert_eq!(cfg.seed(), 2);
+    }
+
+    #[test]
+    fn test_max_batch_is_at_least_one() {
+        assert_eq!(RaftConfig::single(1).with_max_batch(0).max_batch(), 1);
+        assert_eq!(RaftConfig::single(1).with_max_batch(128).max_batch(), 128);
     }
 
     #[test]

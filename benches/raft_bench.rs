@@ -12,7 +12,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use raft_io::{Event, Message, RaftConfig, RaftNode, RequestVote};
+use raft_io::{AppendEntries, Event, LogEntry, Message, RaftConfig, RaftNode, RequestVote};
 
 /// Drives a fresh single-node cluster to leadership for proposal benchmarks.
 fn fresh_leader() -> RaftNode {
@@ -63,6 +63,33 @@ fn bench_step(c: &mut Criterion) {
                         },
                     ))))
                     .expect("vote");
+                black_box(actions);
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    // Follower applying a batch of replicated entries: the replication receive
+    // hot path. Each iteration starts from a fresh, empty follower.
+    c.bench_function("step_follower_append_batch_8", |b| {
+        let entries: Vec<LogEntry> = (1..=8)
+            .map(|i| LogEntry::new(1, i, vec![i as u8]))
+            .collect();
+        b.iter_batched(
+            || RaftNode::new(RaftConfig::new(1, [2, 3])),
+            |mut node| {
+                let actions = node
+                    .step(black_box(Event::Message(Message::AppendEntries(
+                        AppendEntries {
+                            term: 1,
+                            leader: 2,
+                            prev_log_index: 0,
+                            prev_log_term: 0,
+                            entries: entries.clone(),
+                            leader_commit: 8,
+                        },
+                    ))))
+                    .expect("append");
                 black_box(actions);
             },
             criterion::BatchSize::SmallInput,

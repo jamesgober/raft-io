@@ -9,14 +9,15 @@
 //! [`RaftTransport`](crate::RaftTransport) the caller drives. That is what makes
 //! the protocol reproducible from a seed and a sequence of events.
 //!
-//! # Scope at v0.2
+//! # Scope at v0.3
 //!
-//! This release implements leader election with full term and vote safety, the
-//! heartbeat that keeps a leader in place, and commit on a single-node cluster.
-//! Multi-node log replication — carrying entries in [`AppendEntries`], tracking
-//! each follower's progress, and advancing the commit index on a quorum —
-//! arrives in `v0.3`. The message shapes already carry the fields that work
-//! needs, so callers will not see a wire change.
+//! This release implements the full replication pipeline on top of v0.2's
+//! election layer: `AppendEntries` carries entries in bounded batches, the
+//! leader tracks each follower's progress (probing for the match point, then
+//! streaming with optimistic pipelining), rejections backtrack a whole term at a
+//! time via a conflict hint, and the commit index advances once a quorum stores
+//! an entry of the current term. Durable persistence (`wal-db`) is `v0.4` and
+//! snapshots are `v0.5`.
 //!
 //! [`step`]: RaftNode::step
 //! [`Tick`]: Event::Tick
@@ -114,6 +115,31 @@ pub enum Action {
     },
 }
 
+/// How a leader is replicating to one follower.
+///
+/// A leader does not know where a new follower's log diverges from its own, so
+/// it starts in `Probe`: it sends conservatively and waits for each reply,
+/// backtracking on rejection until an append is accepted. Once the match point
+/// is found it switches to `Replicate` and streams entries, advancing
+/// optimistically without waiting — the pipelining that gives steady-state
+/// throughput.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProgressState {
+    Probe,
+    Replicate,
+}
+
+/// The leader's view of one follower's replication progress.
+#[derive(Clone, Copy, Debug)]
+struct Progress {
+    /// Index of the next entry to send this follower.
+    next_index: Index,
+    /// Highest index known to be replicated on this follower.
+    match_index: Index,
+    /// Whether we are still probing for the match point or streaming.
+    state: ProgressState,
+}
+
 /// A node in a Raft cluster: the deterministic consensus state machine.
 ///
 /// Create one with [`new`](RaftNode::new) (Tier 1, in-memory log) or
@@ -140,6 +166,7 @@ pub struct RaftNode<L: RaftLog = MemoryLog> {
     election_timeout_min: u32,
     election_timeout_max: u32,
     heartbeat_interval: u32,
+    max_batch: usize,
 
     log: L,
     role: Role,
@@ -153,6 +180,9 @@ pub struct RaftNode<L: RaftLog = MemoryLog> {
     heartbeat_elapsed: u32,
     election_timeout: u32,
     votes: Vec<NodeId>,
+    /// Per-peer replication progress, aligned with `peers`. Non-empty only while
+    /// this node is the leader.
+    progress: Vec<Progress>,
     rng: Rng,
 }
 
@@ -209,6 +239,7 @@ impl<L: RaftLog> RaftNode<L> {
             election_timeout_min: config.election_timeout_min,
             election_timeout_max: config.election_timeout_max,
             heartbeat_interval: config.heartbeat_interval,
+            max_batch: config.max_batch,
             log,
             role: Role::Follower,
             current_term: hard.term,
@@ -220,6 +251,7 @@ impl<L: RaftLog> RaftNode<L> {
             heartbeat_elapsed: 0,
             election_timeout,
             votes: Vec::new(),
+            progress: Vec::new(),
             rng,
         }
     }
@@ -356,7 +388,7 @@ impl<L: RaftLog> RaftNode<L> {
                 self.heartbeat_elapsed += 1;
                 if self.heartbeat_elapsed >= self.heartbeat_interval {
                     self.heartbeat_elapsed = 0;
-                    self.broadcast_heartbeat(&mut actions);
+                    self.replicate_to_all(&mut actions);
                 }
             }
         }
@@ -368,6 +400,7 @@ impl<L: RaftLog> RaftNode<L> {
         self.current_term += 1;
         self.voted_for = Some(self.id);
         self.leader_id = None;
+        self.progress.clear();
         self.votes.clear();
         self.votes.push(self.id);
         self.reset_election_timer();
@@ -400,27 +433,78 @@ impl<L: RaftLog> RaftNode<L> {
         self.role = Role::Leader;
         self.leader_id = Some(self.id);
         self.heartbeat_elapsed = 0;
-        // Establish authority right away, and (single-node) commit anything
-        // outstanding from the current term.
-        self.broadcast_heartbeat(actions);
-        self.advance_commit_as_leader(actions);
+        // Initialise per-peer progress: optimistically assume each follower is
+        // caught up (next = last + 1) and probe to find where it actually is.
+        let next = self.log.last_index() + 1;
+        self.progress = self
+            .peers
+            .iter()
+            .map(|_| Progress {
+                next_index: next,
+                match_index: 0,
+                state: ProgressState::Probe,
+            })
+            .collect();
+        // Assert authority at once with an initial round of appends, and
+        // (single-node) commit anything outstanding from the current term.
+        self.replicate_to_all(actions);
+        self.advance_commit(actions);
     }
 
-    fn broadcast_heartbeat(&self, actions: &mut Vec<Action>) {
-        let prev_log_index = self.log.last_index();
-        let prev_log_term = self.log.last_term();
-        for &peer in &self.peers {
-            actions.push(Action::Send {
-                to: peer,
-                message: Message::AppendEntries(AppendEntries {
-                    term: self.current_term,
-                    leader: self.id,
-                    prev_log_index,
-                    prev_log_term,
-                    entries: Vec::new(),
-                    leader_commit: self.commit_index,
-                }),
-            });
+    /// Sends an `AppendEntries` to every peer. On a heartbeat tick this both
+    /// asserts leadership (empty append to caught-up followers) and probes or
+    /// streams to those behind.
+    fn replicate_to_all(&mut self, actions: &mut Vec<Action>) {
+        for i in 0..self.peers.len() {
+            self.send_append(i, actions);
+        }
+    }
+
+    /// Streams freshly appended entries to peers already in `Replicate` state.
+    /// Probing peers are driven by replies and heartbeats instead, so a busy
+    /// proposer does not flood a lagging follower with redundant probes.
+    fn replicate_to_streaming(&mut self, actions: &mut Vec<Action>) {
+        for i in 0..self.peers.len() {
+            if self.progress[i].state == ProgressState::Replicate {
+                self.send_append(i, actions);
+            }
+        }
+    }
+
+    /// Builds and emits one `AppendEntries` for peer index `i`, carrying up to
+    /// `max_batch` entries from that peer's `next_index`. In `Replicate` state a
+    /// non-empty send advances `next_index` optimistically so the next batch can
+    /// follow without waiting for the reply (pipelining).
+    fn send_append(&mut self, i: usize, actions: &mut Vec<Action>) {
+        let peer = self.peers[i];
+        let next = self.progress[i].next_index;
+        let state = self.progress[i].state;
+        let prev_log_index = next - 1;
+        let prev_log_term = self.log.term_at(prev_log_index).unwrap_or(0);
+
+        let last = self.log.last_index();
+        let entries = if last >= next {
+            let to = last.min(next + self.max_batch as Index - 1);
+            self.log.entries(next, to)
+        } else {
+            Vec::new()
+        };
+        let count = entries.len() as Index;
+
+        actions.push(Action::Send {
+            to: peer,
+            message: Message::AppendEntries(AppendEntries {
+                term: self.current_term,
+                leader: self.id,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit: self.commit_index,
+            }),
+        });
+
+        if count > 0 && state == ProgressState::Replicate {
+            self.progress[i].next_index = next + count;
         }
     }
 
@@ -438,28 +522,48 @@ impl<L: RaftLog> RaftNode<L> {
         self.log.sync()?;
 
         let mut actions = Vec::new();
-        // v0.3 replicates the entry to peers here. For now, a single-node leader
-        // commits it at once; a multi-node leader holds it until replication.
-        self.advance_commit_as_leader(&mut actions);
+        // Stream the new entry to followers that are caught up; commit at once if
+        // a quorum already holds it (the single-node case).
+        self.replicate_to_streaming(&mut actions);
+        self.advance_commit(&mut actions);
         Ok(actions)
     }
 
-    /// Advances the commit index using what the leader knows.
+    /// Advances the commit index to the highest entry a quorum has stored.
     ///
-    /// At `v0.2` the leader tracks only its own log, so this commits entries
-    /// only when one node is a majority — that is, a single-node cluster. With
-    /// peers present, the commit index moves once replication (v0.3) reports a
-    /// quorum has the entry. Either way Raft's rule holds: only an entry from
-    /// the current term is committed by counting replicas.
-    fn advance_commit_as_leader(&mut self, actions: &mut Vec<Action>) {
+    /// Counts, for each candidate index `n`, the leader plus every follower
+    /// whose `match_index` reaches `n`. Raft's safety rule (§5.4.2) is enforced
+    /// strictly: an entry is committed by counting replicas **only if it was
+    /// created in the current term**. Older-term entries ride along once a
+    /// current-term entry above them commits. A single-node cluster commits its
+    /// own current-term tail immediately (quorum of one).
+    fn advance_commit(&mut self, actions: &mut Vec<Action>) {
         let last = self.log.last_index();
-        // Replicas that hold `last`: just this leader for now (1).
-        let replicas_with_last = 1;
-        if replicas_with_last >= self.quorum
-            && last > self.commit_index
-            && self.log.term_at(last) == Some(self.current_term)
-        {
-            self.commit_index = last;
+        let mut new_commit = self.commit_index;
+        let mut n = last;
+        while n > self.commit_index {
+            match self.log.term_at(n) {
+                Some(term) if term == self.current_term => {
+                    let mut replicas = 1; // the leader holds it
+                    for p in &self.progress {
+                        if p.match_index >= n {
+                            replicas += 1;
+                        }
+                    }
+                    if replicas >= self.quorum {
+                        new_commit = n;
+                        break; // highest such index found
+                    }
+                }
+                // Terms never decrease down the log; once we pass below the
+                // current term there is no current-term entry left to commit.
+                Some(term) if term < self.current_term => break,
+                _ => {}
+            }
+            n -= 1;
+        }
+        if new_commit > self.commit_index {
+            self.commit_index = new_commit;
             self.drain_applies(actions);
         }
     }
@@ -491,7 +595,7 @@ impl<L: RaftLog> RaftNode<L> {
             Message::RequestVote(rv) => self.handle_request_vote(rv, &mut actions)?,
             Message::RequestVoteReply(reply) => self.handle_vote_reply(reply, &mut actions),
             Message::AppendEntries(ae) => self.handle_append_entries(ae, &mut actions)?,
-            Message::AppendEntriesReply(reply) => self.handle_append_reply(reply),
+            Message::AppendEntriesReply(reply) => self.handle_append_reply(reply, &mut actions),
         }
         Ok(actions)
     }
@@ -505,6 +609,7 @@ impl<L: RaftLog> RaftNode<L> {
         }
         self.leader_id = leader;
         self.votes.clear();
+        self.progress.clear();
         if hard_state_changed {
             self.persist_hard_state()?;
         }
@@ -563,47 +668,186 @@ impl<L: RaftLog> RaftNode<L> {
         ae: AppendEntries,
         actions: &mut Vec<Action>,
     ) -> Result<()> {
-        let mut success = false;
-        let mut match_index = 0;
+        let mut reply = AppendEntriesReply {
+            term: self.current_term,
+            success: false,
+            from: self.id,
+            match_index: 0,
+            conflict_index: 0,
+            conflict_term: 0,
+        };
 
-        if ae.term >= self.current_term {
-            // A valid leader for our term: accept its authority.
-            self.role = Role::Follower;
-            self.leader_id = Some(ae.leader);
-            self.reset_election_timer();
-
-            let prev_ok = ae.prev_log_index == 0
-                || self.log.term_at(ae.prev_log_index) == Some(ae.prev_log_term);
-            if prev_ok {
-                success = true;
-                // v0.2 heartbeats carry no entries; v0.3 appends them here.
-                match_index = ae.prev_log_index;
-                if ae.leader_commit > self.commit_index {
-                    self.commit_index = ae.leader_commit.min(self.log.last_index());
-                    self.drain_applies(actions);
-                }
-            }
+        // Reject a stale leader outright, telling it our (higher) term.
+        if ae.term < self.current_term {
+            actions.push(Action::Send {
+                to: ae.leader,
+                message: Message::AppendEntriesReply(reply),
+            });
+            return Ok(());
         }
 
+        // A valid leader for our term: accept its authority and reset the timer.
+        self.role = Role::Follower;
+        self.leader_id = Some(ae.leader);
+        self.reset_election_timer();
+
+        // Log-consistency check at prev_log_index.
+        let prev_ok =
+            ae.prev_log_index == 0 || self.log.term_at(ae.prev_log_index) == Some(ae.prev_log_term);
+        if !prev_ok {
+            // Supply a conflict hint so the leader can skip back a whole term.
+            let last = self.log.last_index();
+            if ae.prev_log_index > last {
+                reply.conflict_index = last + 1;
+                reply.conflict_term = 0;
+            } else {
+                let conflict_term = self.log.term_at(ae.prev_log_index).unwrap_or(0);
+                reply.conflict_term = conflict_term;
+                reply.conflict_index = self.first_index_of_term(conflict_term, ae.prev_log_index);
+            }
+            actions.push(Action::Send {
+                to: ae.leader,
+                message: Message::AppendEntriesReply(reply),
+            });
+            return Ok(());
+        }
+
+        // The logs match up to prev_log_index. Append the new entries, resolving
+        // any divergent tail, and report how far we now agree.
+        let match_index = if ae.entries.is_empty() {
+            ae.prev_log_index
+        } else {
+            self.append_from_leader(&ae.entries)?
+        };
+
+        if ae.leader_commit > self.commit_index {
+            // Never commit past the last entry this RPC actually covers.
+            self.commit_index = ae.leader_commit.min(match_index);
+            self.drain_applies(actions);
+        }
+
+        reply.success = true;
+        reply.match_index = match_index;
         actions.push(Action::Send {
             to: ae.leader,
-            message: Message::AppendEntriesReply(AppendEntriesReply {
-                term: self.current_term,
-                success,
-                from: self.id,
-                match_index,
-            }),
+            message: Message::AppendEntriesReply(reply),
         });
         Ok(())
     }
 
-    /// Handles a follower's reply to a heartbeat or append.
+    /// Reconciles the leader's entries into the follower's log.
     ///
-    /// A higher term has already stepped the leader down in
-    /// [`handle_message`](Self::handle_message). Tracking each follower's
-    /// `match_index` and advancing the commit index on a quorum is the
-    /// replication work of `v0.3`; at `v0.2` there is nothing further to do.
-    fn handle_append_reply(&mut self, _reply: AppendEntriesReply) {}
+    /// Skips a prefix that already matches (same index and term), truncates the
+    /// first divergent entry and everything after it, then appends the rest. The
+    /// protocol guarantees a leader never sends entries that conflict below the
+    /// commit index, so this never discards committed state. Returns the index
+    /// of the last entry now stored from this batch.
+    fn append_from_leader(&mut self, entries: &[LogEntry]) -> Result<Index> {
+        let mut i = 0;
+        while i < entries.len() {
+            let entry = &entries[i];
+            match self.log.term_at(entry.index) {
+                Some(term) if term == entry.term => i += 1,
+                Some(_) => {
+                    // Divergence: drop the conflicting tail and stop scanning.
+                    self.log.truncate(entry.index)?;
+                    break;
+                }
+                None => break, // beyond our log; append from here on
+            }
+        }
+        if i < entries.len() {
+            self.log.append(&entries[i..])?;
+            self.log.sync()?;
+        }
+        Ok(entries[entries.len() - 1].index)
+    }
+
+    fn handle_append_reply(&mut self, reply: AppendEntriesReply, actions: &mut Vec<Action>) {
+        if self.role != Role::Leader || reply.term != self.current_term {
+            return; // not leader, or a stale reply from another term
+        }
+        let Some(i) = self.peer_index(reply.from) else {
+            return;
+        };
+
+        if reply.success {
+            // match_index only ever advances, tolerating reordered duplicates.
+            if reply.match_index > self.progress[i].match_index {
+                self.progress[i].match_index = reply.match_index;
+            }
+            let want_next = self.progress[i].match_index + 1;
+            if want_next > self.progress[i].next_index {
+                self.progress[i].next_index = want_next;
+            }
+            self.progress[i].state = ProgressState::Replicate;
+            self.advance_commit(actions);
+            // Pipeline: if the follower is still behind, send the next batch now.
+            if self.progress[i].next_index <= self.log.last_index() {
+                self.send_append(i, actions);
+            }
+        } else {
+            // Rejected: backtrack next_index using the follower's conflict hint,
+            // drop to Probe, and retry at once.
+            let next = self.progress[i].next_index;
+            let matched = self.progress[i].match_index;
+            self.progress[i].next_index =
+                self.rejected_next(next, matched, reply.conflict_index, reply.conflict_term);
+            self.progress[i].state = ProgressState::Probe;
+            self.send_append(i, actions);
+        }
+    }
+
+    /// Computes the `next_index` to retry after a rejection, using the conflict
+    /// hint. Prefers to jump just past the leader's last entry of the conflict
+    /// term; otherwise falls back to the follower's suggested index. The result
+    /// never rises (a rejection only backtracks) and never drops at or below the
+    /// confirmed `match_index`, which bounds probing and guarantees it converges.
+    fn rejected_next(
+        &self,
+        current_next: Index,
+        match_index: Index,
+        conflict_index: Index,
+        conflict_term: Term,
+    ) -> Index {
+        let floor = match_index + 1;
+        let mut target = conflict_index.max(1);
+        if conflict_term > 0 {
+            if let Some(last) = self.last_index_of_term(conflict_term) {
+                target = last + 1;
+            }
+        }
+        let ceil = current_next.saturating_sub(1).max(floor);
+        target.clamp(floor, ceil)
+    }
+
+    /// First index of the contiguous run of `term` ending at `upto`.
+    fn first_index_of_term(&self, term: Term, upto: Index) -> Index {
+        let mut i = upto;
+        while i > 1 && self.log.term_at(i - 1) == Some(term) {
+            i -= 1;
+        }
+        i
+    }
+
+    /// Highest index in the leader's log whose entry has `term`, if any. Relies
+    /// on terms being non-decreasing down the log to stop early.
+    fn last_index_of_term(&self, term: Term) -> Option<Index> {
+        let mut i = self.log.last_index();
+        while i >= 1 {
+            match self.log.term_at(i) {
+                Some(t) if t == term => return Some(i),
+                Some(t) if t < term => return None,
+                _ => {}
+            }
+            i -= 1;
+        }
+        None
+    }
+
+    fn peer_index(&self, id: NodeId) -> Option<usize> {
+        self.peers.iter().position(|&p| p == id)
+    }
 
     // ---- shared helpers --------------------------------------------------
 
@@ -868,5 +1112,262 @@ mod tests {
                 voted_for: Some(2)
             }
         );
+    }
+
+    // ---- v0.3 replication --------------------------------------------------
+
+    fn entry(term: Term, index: Index) -> LogEntry {
+        LogEntry::new(term, index, vec![index as u8])
+    }
+
+    fn first_append_entries(actions: &[Action], to: NodeId) -> AppendEntries {
+        actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send {
+                    to: dst,
+                    message: Message::AppendEntries(ae),
+                } if *dst == to => Some(ae.clone()),
+                _ => None,
+            })
+            .expect("an AppendEntries to the peer")
+    }
+
+    /// Walks a `{1,2,3}` leader through replicating a proposal to follower 2 and
+    /// confirms commit lands once a quorum (leader + one follower) holds it.
+    #[test]
+    fn test_leader_replicates_and_commits_on_quorum() {
+        let mut node = elect_multi_node_leader();
+        // Bring follower 2 into Replicate state with an accepted heartbeat.
+        let _ = node
+            .step(Event::Message(Message::AppendEntriesReply(
+                AppendEntriesReply {
+                    term: node.term(),
+                    success: true,
+                    from: 2,
+                    match_index: 0,
+                    conflict_index: 0,
+                    conflict_term: 0,
+                },
+            )))
+            .unwrap();
+
+        // Propose: the entry streams to follower 2 but is not yet committed.
+        let actions = node.step(Event::Propose(b"x".to_vec())).unwrap();
+        assert_eq!(node.commit_index(), 0);
+        let ae = first_append_entries(&actions, 2);
+        assert_eq!(ae.entries.len(), 1);
+        assert_eq!(ae.entries[0].index, 1);
+
+        // Follower 2 acknowledges index 1: quorum reached, entry commits/applies.
+        let applied = node
+            .step(Event::Message(Message::AppendEntriesReply(
+                AppendEntriesReply {
+                    term: node.term(),
+                    success: true,
+                    from: 2,
+                    match_index: 1,
+                    conflict_index: 0,
+                    conflict_term: 0,
+                },
+            )))
+            .unwrap();
+        assert_eq!(node.commit_index(), 1);
+        assert!(
+            applied
+                .iter()
+                .any(|a| matches!(a, Action::Apply { index: 1, .. }))
+        );
+    }
+
+    #[test]
+    fn test_follower_appends_streamed_entries() {
+        let mut node = RaftNode::new(RaftConfig::new(5, [1]));
+        let actions = node
+            .step(Event::Message(Message::AppendEntries(AppendEntries {
+                term: 2,
+                leader: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![entry(2, 1), entry(2, 2)],
+                leader_commit: 2,
+            })))
+            .unwrap();
+        assert_eq!(node.log().last_index(), 2);
+        assert_eq!(node.commit_index(), 2);
+        let reply = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send {
+                    message: Message::AppendEntriesReply(r),
+                    ..
+                } => Some(r.clone()),
+                _ => None,
+            })
+            .expect("a reply");
+        assert!(reply.success);
+        assert_eq!(reply.match_index, 2);
+    }
+
+    #[test]
+    fn test_follower_truncates_divergent_tail() {
+        // Follower already holds [t1@1, t2@2]; leader overwrites index 2 with t3.
+        let mut log = MemoryLog::new();
+        log.append(&[entry(1, 1), entry(2, 2)]).unwrap();
+        let mut node = RaftNode::with_log(RaftConfig::new(5, [1]), log);
+
+        let actions = node
+            .step(Event::Message(Message::AppendEntries(AppendEntries {
+                term: 3,
+                leader: 1,
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: vec![entry(3, 2)],
+                leader_commit: 0,
+            })))
+            .unwrap();
+        assert_eq!(node.log().last_index(), 2);
+        assert_eq!(node.log().entry(2).unwrap().term, 3);
+        let reply = first_reply(&actions);
+        assert!(reply.success);
+        assert_eq!(reply.match_index, 2);
+    }
+
+    #[test]
+    fn test_follower_rejects_short_log_with_length_hint() {
+        let mut node = RaftNode::new(RaftConfig::new(5, [1]));
+        let actions = node
+            .step(Event::Message(Message::AppendEntries(AppendEntries {
+                term: 2,
+                leader: 1,
+                prev_log_index: 3,
+                prev_log_term: 1,
+                entries: vec![entry(2, 4)],
+                leader_commit: 0,
+            })))
+            .unwrap();
+        let reply = first_reply(&actions);
+        assert!(!reply.success);
+        assert_eq!(reply.conflict_index, 1); // empty log => probe from index 1
+        assert_eq!(reply.conflict_term, 0);
+    }
+
+    #[test]
+    fn test_follower_rejects_term_mismatch_with_term_hint() {
+        // Follower holds three term-1 entries; leader probes with a wrong term.
+        let mut log = MemoryLog::new();
+        log.append(&[entry(1, 1), entry(1, 2), entry(1, 3)])
+            .unwrap();
+        let mut node = RaftNode::with_log(RaftConfig::new(5, [1]), log);
+
+        let actions = node
+            .step(Event::Message(Message::AppendEntries(AppendEntries {
+                term: 5,
+                leader: 1,
+                prev_log_index: 3,
+                prev_log_term: 4, // follower has term 1 there
+                entries: Vec::new(),
+                leader_commit: 0,
+            })))
+            .unwrap();
+        let reply = first_reply(&actions);
+        assert!(!reply.success);
+        assert_eq!(reply.conflict_term, 1);
+        assert_eq!(reply.conflict_index, 1); // first index of the term-1 run
+    }
+
+    #[test]
+    fn test_rejection_backtracks_then_converges() {
+        // Leader 1 has [t1@1, t1@2, t1@3] and a fresh follower 2 that is empty.
+        let mut log = MemoryLog::new();
+        log.append(&[entry(1, 1), entry(1, 2), entry(1, 3)])
+            .unwrap();
+        log.set_hard_state(HardState {
+            term: 1,
+            voted_for: Some(1),
+        })
+        .unwrap();
+        let mut leader =
+            RaftNode::with_log(RaftConfig::new(1, [2]).with_election_timeout(5, 5), log);
+        let mut follower = RaftNode::new(RaftConfig::new(2, [1]));
+
+        // Elect leader 1 (2-node quorum is 2; feed a granting vote from 2).
+        let mut pending = Vec::new();
+        for _ in 0..50 {
+            let acts = leader.step(Event::Tick).unwrap();
+            if !acts.is_empty() {
+                pending = acts;
+                break;
+            }
+        }
+        // The candidate's term is now 2; grant it.
+        let _ = leader
+            .step(Event::Message(Message::RequestVoteReply(
+                RequestVoteReply {
+                    term: leader.term(),
+                    vote_granted: true,
+                    from: 2,
+                },
+            )))
+            .unwrap();
+        assert!(leader.is_leader());
+        let _ = pending;
+
+        // Pump messages between the two until the follower catches up.
+        let mut queue: Vec<(NodeId, Message)> = drain_sends(&mut leader);
+        for _ in 0..100 {
+            if follower.log().last_index() == 3 {
+                break;
+            }
+            let mut next = Vec::new();
+            for (to, msg) in queue.drain(..) {
+                let acts = if to == 2 {
+                    follower.step(Event::Message(msg)).unwrap()
+                } else {
+                    leader.step(Event::Message(msg)).unwrap()
+                };
+                next.extend(collect_sends(acts));
+            }
+            queue = next;
+            if queue.is_empty() {
+                queue = leader
+                    .step(Event::Tick)
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(send_pair)
+                    .collect();
+            }
+        }
+        assert_eq!(follower.log().last_index(), 3);
+        assert_eq!(follower.log().entry(3).unwrap().term, 1);
+    }
+
+    fn first_reply(actions: &[Action]) -> AppendEntriesReply {
+        actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send {
+                    message: Message::AppendEntriesReply(r),
+                    ..
+                } => Some(r.clone()),
+                _ => None,
+            })
+            .expect("an AppendEntriesReply")
+    }
+
+    fn send_pair(a: Action) -> Option<(NodeId, Message)> {
+        match a {
+            Action::Send { to, message } => Some((to, message)),
+            _ => None,
+        }
+    }
+
+    fn collect_sends(actions: Vec<Action>) -> Vec<(NodeId, Message)> {
+        actions.into_iter().filter_map(send_pair).collect()
+    }
+
+    fn drain_sends(node: &mut RaftNode) -> Vec<(NodeId, Message)> {
+        let acts = node.step(Event::Tick).unwrap();
+        collect_sends(acts)
     }
 }

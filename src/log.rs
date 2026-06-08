@@ -68,6 +68,28 @@ pub trait RaftLog {
     /// Returns the entry at `index`, or `None` if there is none.
     fn entry(&self, index: Index) -> Option<LogEntry>;
 
+    /// Returns the entries in the inclusive index range `[from, to]`.
+    ///
+    /// Indices outside the log are skipped, and an empty range (`to < from`, or
+    /// `from == 0`) yields an empty vector. The leader uses this to assemble a
+    /// replication batch. The default implementation reads each index through
+    /// [`entry`](RaftLog::entry); a backend that stores entries contiguously
+    /// should override it with a single bulk read.
+    fn entries(&self, from: Index, to: Index) -> Vec<LogEntry> {
+        if from == 0 || to < from {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity((to - from + 1) as usize);
+        let mut index = from;
+        while index <= to {
+            if let Some(entry) = self.entry(index) {
+                out.push(entry);
+            }
+            index += 1;
+        }
+        out
+    }
+
     /// Appends `entries` to the end of the log.
     ///
     /// The first entry's index must be exactly `last_index() + 1` and the
@@ -217,6 +239,18 @@ impl RaftLog for MemoryLog {
         self.entries.get((index - 1) as usize).cloned()
     }
 
+    fn entries(&self, from: Index, to: Index) -> Vec<LogEntry> {
+        if from == 0 || to < from {
+            return Vec::new();
+        }
+        let start = (from - 1) as usize;
+        let end = (to as usize).min(self.entries.len());
+        if start >= end {
+            return Vec::new();
+        }
+        self.entries[start..end].to_vec()
+    }
+
     fn append(&mut self, entries: &[LogEntry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -332,6 +366,72 @@ mod tests {
         let mut log = MemoryLog::new();
         let err = log.append(&[entry(1, 1), entry(1, 3)]).unwrap_err();
         assert!(matches!(err, Error::Storage { .. }));
+    }
+
+    #[test]
+    fn test_entries_range_inclusive() {
+        let mut log = MemoryLog::new();
+        log.append(&[entry(1, 1), entry(1, 2), entry(2, 3), entry(2, 4)])
+            .unwrap();
+        let mid = log.entries(2, 3);
+        assert_eq!(mid.len(), 2);
+        assert_eq!(mid[0].index, 2);
+        assert_eq!(mid[1].index, 3);
+    }
+
+    #[test]
+    fn test_entries_range_clamps_and_handles_empty() {
+        let mut log = MemoryLog::new();
+        log.append(&[entry(1, 1), entry(1, 2)]).unwrap();
+        // Past the end is clamped.
+        assert_eq!(log.entries(1, 99).len(), 2);
+        // Empty / degenerate ranges yield nothing.
+        assert!(log.entries(3, 2).is_empty());
+        assert!(log.entries(0, 5).is_empty());
+        assert!(log.entries(5, 9).is_empty());
+    }
+
+    #[test]
+    fn test_default_entries_matches_override() {
+        // Drive the trait's default `entries` impl through a wrapper that does
+        // not override it, and confirm it agrees with `MemoryLog`'s bulk read.
+        struct Wrap(MemoryLog);
+        impl RaftLog for Wrap {
+            fn last_index(&self) -> Index {
+                self.0.last_index()
+            }
+            fn last_term(&self) -> Term {
+                self.0.last_term()
+            }
+            fn term_at(&self, index: Index) -> Option<Term> {
+                self.0.term_at(index)
+            }
+            fn entry(&self, index: Index) -> Option<LogEntry> {
+                self.0.entry(index)
+            }
+            fn append(&mut self, entries: &[LogEntry]) -> Result<()> {
+                self.0.append(entries)
+            }
+            fn truncate(&mut self, from: Index) -> Result<()> {
+                self.0.truncate(from)
+            }
+            fn hard_state(&self) -> HardState {
+                self.0.hard_state()
+            }
+            fn set_hard_state(&mut self, state: HardState) -> Result<()> {
+                self.0.set_hard_state(state)
+            }
+            fn sync(&mut self) -> Result<()> {
+                self.0.sync()
+            }
+        }
+        let mut inner = MemoryLog::new();
+        inner
+            .append(&[entry(1, 1), entry(1, 2), entry(2, 3)])
+            .unwrap();
+        let wrap = Wrap(inner.clone());
+        assert_eq!(wrap.entries(1, 3), inner.entries(1, 3));
+        assert_eq!(wrap.entries(2, 2), inner.entries(2, 2));
     }
 
     #[test]
