@@ -1,0 +1,103 @@
+# ██████╗ ███████╗██████╗ ███████╗
+# ██╔══██╗██╔════╝██╔══██╗██╔════╝
+# ██████╔╝█████╗  ██████╔╝███████╗
+# ██╔══██╗██╔══╝  ██╔═══╝ ╚════██║
+# ██║  ██║███████╗██║     ███████║
+# ╚═╝  ╚═╝╚══════╝╚═╝     ╚══════╝
+#╔═══════════════════════════════╗
+#║ Rust Efficiency & Performance ║
+#╚═══════════════════════════════╝
+[package]
+name    = "raft-io"
+version = "0.1.0"
+
+# Minimum Supported Rust Version (MSRV)
+rust-version = "1.85"
+edition = "2024"
+
+# License
+license = "Apache-2.0 OR MIT"
+
+# Readme
+readme = "README.md"
+
+# Description
+description = "Raft consensus and replicated-log engine for Rust. Leader election, log replication, membership changes, and snapshotting over a pluggable transport and a pluggable log store. The consensus layer above wal-db and the coordination substrate for Hive DB clustering."
+
+# Keywords (5 max)
+keywords = [
+    "raft",
+    "consensus",
+    "distributed-systems",
+    "state-machine",
+    "replication"
+]
+
+# Categories
+categories = [
+    "algorithms",
+    "concurrency",
+    "network-programming"
+]
+
+# Links
+homepage      = "https://github.com/jamesgober/raft-io"
+repository    = "https://github.com/jamesgober/raft-io"
+documentation = "https://docs.rs/raft-io"
+
+# Authors
+authors = [
+    "James Gober <me@jamesgober.com>"
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "raft_io"
+path = "src/lib.rs"
+
+
+# FEATURE FLAGS
+# #################################
+# Additive only. `persistence` (wal-db) arrives in v0.4 and `framing`
+# (pack-io) in v0.5, each wired when the code that uses it lands; an
+# optional dependency with no gated code path would violate REPS.
+
+
+# DEPENDENCIES
+# #################################
+[dependencies]
+# Domain error type. Portfolio crates standardise on `error-forge` for the
+# stable `kind` / `caption` / severity metadata consumers rely on; its
+# `ForgeError` supertrait is `std::error::Error`, so the crate is std-based.
+error-forge = { version = "1", default-features = false }
+
+
+# DEV DEPENDENCIES
+# #################################
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest  = "1"
+tempfile  = "3"
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+
+# BENCHMARKS
+# #################################
+[[bench]]
+name    = "raft_bench"
+harness = false
+
+
+# RELEASE PROFILE
+# #################################
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
