@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "raft-io"
-version = "0.4.0"
+version = "0.5.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -61,13 +61,15 @@ path = "src/lib.rs"
 
 # FEATURE FLAGS
 # #################################
-# Additive only. `framing` (pack-io) arrives in v0.5, wired when the code that
-# uses it lands; an optional dependency with no gated code path would violate
-# REPS.
+# Additive only.
 [features]
 # Durable Raft log via `wal-db`: adds `WalLog`, a `RaftLog` whose entries and
 # hard state survive a restart. The in-memory path is unaffected when off.
 persistence = ["dep:wal-db"]
+# Typed wire framing via `pack-io`: adds `framing::encode` / `framing::decode`
+# for `Message`, and derives `pack_io::Serialize`/`Deserialize` on the message
+# types. Off by default; the protocol is unchanged when disabled.
+framing = ["dep:pack-io", "pack-io/derive"]
 
 
 # DEPENDENCIES
@@ -80,6 +82,8 @@ error-forge = { version = "1", default-features = false }
 # Durable write-ahead log backing `WalLog`, behind the `persistence` feature.
 # Byte-record API only (no `pack-io` feature): raft-io frames its own records.
 wal-db = { version = "1.0", optional = true, default-features = false }
+# Typed message framing, behind the `framing` feature.
+pack-io = { version = "1.0", optional = true, default-features = false }
 
 
 # DEV DEPENDENCIES

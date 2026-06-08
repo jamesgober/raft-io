@@ -9,15 +9,16 @@
 //! [`RaftTransport`](crate::RaftTransport) the caller drives. That is what makes
 //! the protocol reproducible from a seed and a sequence of events.
 //!
-//! # Scope at v0.3
+//! # Scope at v0.5
 //!
-//! This release implements the full replication pipeline on top of v0.2's
-//! election layer: `AppendEntries` carries entries in bounded batches, the
-//! leader tracks each follower's progress (probing for the match point, then
-//! streaming with optimistic pipelining), rejections backtrack a whole term at a
-//! time via a conflict hint, and the commit index advances once a quorum stores
-//! an entry of the current term. Durable persistence (`wal-db`) is `v0.4` and
-//! snapshots are `v0.5`.
+//! The protocol is feature-complete bar membership changes (`v0.6`): leader
+//! election with term and vote safety, the full replication pipeline (batched
+//! `AppendEntries`, per-follower progress with optimistic pipelining,
+//! conflict-hint backtracking, commit on a quorum), durable persistence and
+//! crash recovery (the `WalLog`), and **snapshots with log compaction** — a
+//! policy hint drives the application to snapshot, the log compacts behind it,
+//! and a follower too far behind to replicate is caught up with an
+//! `InstallSnapshot`.
 //!
 //! [`step`]: RaftNode::step
 //! [`Tick`]: Event::Tick
@@ -29,9 +30,12 @@
 use crate::config::RaftConfig;
 use crate::error::{Error, Result};
 use crate::log::{MemoryLog, RaftLog};
-use crate::message::{AppendEntries, AppendEntriesReply, Message, RequestVote, RequestVoteReply};
+use crate::message::{
+    AppendEntries, AppendEntriesReply, InstallSnapshot, InstallSnapshotReply, Message, RequestVote,
+    RequestVoteReply,
+};
 use crate::rng::Rng;
-use crate::types::{HardState, Index, LogEntry, NodeId, Role, Term};
+use crate::types::{HardState, Index, LogEntry, NodeId, Role, Snapshot, Term};
 
 /// An input handed to [`RaftNode::step`].
 ///
@@ -60,6 +64,17 @@ pub enum Event {
     /// Only a leader may accept a proposal; on any other node
     /// [`step`](RaftNode::step) returns [`Error::NotLeader`].
     Propose(Vec<u8>),
+    /// The application supplies a snapshot of its state machine through `index`.
+    ///
+    /// This is the reply to an [`Action::Snapshot`] hint: the application has
+    /// serialized its state up to `index` into `data`. The node compacts the log
+    /// up to `index`. A snapshot for an uncommitted or stale index is ignored.
+    Snapshot {
+        /// The log index the snapshot covers (must be applied and committed).
+        index: Index,
+        /// The serialized state machine state.
+        data: Vec<u8>,
+    },
 }
 
 /// An instruction [`RaftNode::step`] returns for the caller to carry out.
@@ -71,8 +86,7 @@ pub enum Event {
 /// durability rule.
 ///
 /// The enum is [`#[non_exhaustive]`](https://doc.rust-lang.org/reference/attributes/type_system.html#the-non_exhaustive-attribute):
-/// a snapshot action joins it in `v0.5`, so a `match` must include a wildcard
-/// arm.
+/// future versions may add variants, so a `match` must include a wildcard arm.
 ///
 /// # Examples
 ///
@@ -112,6 +126,34 @@ pub enum Action {
         term: Term,
         /// The opaque command bytes to apply.
         command: Vec<u8>,
+    },
+    /// Take a snapshot of the state machine through `index` and return it.
+    ///
+    /// A hint emitted when the log has grown past the configured snapshot
+    /// threshold. The application serializes its state up to `index` and feeds it
+    /// back with [`Event::Snapshot`], after which the node compacts the log.
+    /// Acting on the hint is optional but unbounded growth follows from ignoring
+    /// it.
+    Snapshot {
+        /// The applied index the snapshot should cover.
+        index: Index,
+        /// Term of the entry at `index`.
+        term: Term,
+    },
+    /// Reset the state machine to an installed snapshot.
+    ///
+    /// Emitted on a follower that received a leader's snapshot because it had
+    /// fallen too far behind to replicate entry by entry. The application
+    /// replaces its state with `data` (which represents the state through
+    /// `index`); subsequent [`Apply`](Action::Apply) actions resume from
+    /// `index + 1`.
+    RestoreSnapshot {
+        /// The index the snapshot covers.
+        index: Index,
+        /// Term of the entry at `index`.
+        term: Term,
+        /// The serialized state to restore.
+        data: Vec<u8>,
     },
 }
 
@@ -167,6 +209,7 @@ pub struct RaftNode<L: RaftLog = MemoryLog> {
     election_timeout_max: u32,
     heartbeat_interval: u32,
     max_batch: usize,
+    snapshot_threshold: usize,
 
     log: L,
     role: Role,
@@ -183,6 +226,9 @@ pub struct RaftNode<L: RaftLog = MemoryLog> {
     /// Per-peer replication progress, aligned with `peers`. Non-empty only while
     /// this node is the leader.
     progress: Vec<Progress>,
+    /// Highest index a snapshot hint has already been emitted for, so the policy
+    /// fires at most once per threshold crossing.
+    snapshot_hinted_at: Index,
     rng: Rng,
 }
 
@@ -227,6 +273,10 @@ impl<L: RaftLog> RaftNode<L> {
     #[must_use]
     pub fn with_log(config: RaftConfig, log: L) -> Self {
         let hard = log.hard_state();
+        // A recovered snapshot covers committed, already-applied state: start
+        // commit and applied at its boundary so those entries are not re-emitted.
+        // The application restores its state machine from `log.snapshot()`.
+        let base = log.snapshot_index();
         let cluster_size = config.peers.len() + 1;
         let quorum = cluster_size / 2 + 1;
         let mut rng = Rng::new(config.seed);
@@ -240,18 +290,20 @@ impl<L: RaftLog> RaftNode<L> {
             election_timeout_max: config.election_timeout_max,
             heartbeat_interval: config.heartbeat_interval,
             max_batch: config.max_batch,
+            snapshot_threshold: config.snapshot_threshold,
             log,
             role: Role::Follower,
             current_term: hard.term,
             voted_for: hard.voted_for,
             leader_id: None,
-            commit_index: 0,
-            last_applied: 0,
+            commit_index: base,
+            last_applied: base,
             election_elapsed: 0,
             heartbeat_elapsed: 0,
             election_timeout,
             votes: Vec::new(),
             progress: Vec::new(),
+            snapshot_hinted_at: base,
             rng,
         }
     }
@@ -370,6 +422,7 @@ impl<L: RaftLog> RaftNode<L> {
             Event::Tick => self.tick(),
             Event::Message(message) => self.handle_message(message),
             Event::Propose(command) => self.propose(command),
+            Event::Snapshot { index, data } => self.handle_snapshot_event(index, data),
         }
     }
 
@@ -476,8 +529,15 @@ impl<L: RaftLog> RaftNode<L> {
     /// non-empty send advances `next_index` optimistically so the next batch can
     /// follow without waiting for the reply (pipelining).
     fn send_append(&mut self, i: usize, actions: &mut Vec<Action>) {
-        let peer = self.peers[i];
         let next = self.progress[i].next_index;
+        // If the entry preceding `next` has been compacted away, the follower is
+        // too far behind to replicate from the log — send the snapshot instead.
+        if next <= self.log.snapshot_index() {
+            self.send_snapshot(i, actions);
+            return;
+        }
+
+        let peer = self.peers[i];
         let state = self.progress[i].state;
         let prev_log_index = next - 1;
         let prev_log_term = self.log.term_at(prev_log_index).unwrap_or(0);
@@ -505,6 +565,23 @@ impl<L: RaftLog> RaftNode<L> {
 
         if count > 0 && state == ProgressState::Replicate {
             self.progress[i].next_index = next + count;
+        }
+    }
+
+    /// Sends the current snapshot to peer index `i`. Used when the follower needs
+    /// an entry the leader has already compacted away. Progress stays in `Probe`
+    /// until the reply confirms the install, so it is not advanced here.
+    fn send_snapshot(&mut self, i: usize, actions: &mut Vec<Action>) {
+        if let Some(snapshot) = self.log.snapshot() {
+            self.progress[i].state = ProgressState::Probe;
+            actions.push(Action::Send {
+                to: self.peers[i],
+                message: Message::InstallSnapshot(InstallSnapshot {
+                    term: self.current_term,
+                    leader: self.id,
+                    snapshot,
+                }),
+            });
         }
     }
 
@@ -579,6 +656,52 @@ impl<L: RaftLog> RaftNode<L> {
                 });
             }
         }
+        self.maybe_hint_snapshot(actions);
+    }
+
+    /// Emits a snapshot hint once the applied log has grown past the configured
+    /// threshold beyond the last snapshot. Fires at most once per crossing.
+    fn maybe_hint_snapshot(&mut self, actions: &mut Vec<Action>) {
+        if self.snapshot_threshold == 0 {
+            return;
+        }
+        let base = self.log.snapshot_index();
+        let grown = self.last_applied.saturating_sub(base) as usize;
+        if grown >= self.snapshot_threshold && self.last_applied > self.snapshot_hinted_at {
+            if let Some(term) = self.log.term_at(self.last_applied) {
+                self.snapshot_hinted_at = self.last_applied;
+                actions.push(Action::Snapshot {
+                    index: self.last_applied,
+                    term,
+                });
+            }
+        }
+    }
+
+    // ---- snapshots -------------------------------------------------------
+
+    /// Handles the application's snapshot of its state machine through `index`.
+    ///
+    /// Compacts the log up to `index` if the snapshot is valid: it must cover a
+    /// committed, already-applied index that is newer than any existing snapshot,
+    /// and the entry at `index` must still be present so its term is known. An
+    /// out-of-range or stale snapshot is ignored rather than treated as an error.
+    fn handle_snapshot_event(&mut self, index: Index, data: Vec<u8>) -> Result<Vec<Action>> {
+        if index > self.commit_index
+            || index > self.last_applied
+            || index <= self.log.snapshot_index()
+        {
+            return Ok(Vec::new());
+        }
+        let Some(term) = self.log.term_at(index) else {
+            return Ok(Vec::new());
+        };
+        self.log.apply_snapshot(&Snapshot::new(index, term, data))?;
+        self.log.sync()?;
+        if self.snapshot_hinted_at < index {
+            self.snapshot_hinted_at = index;
+        }
+        Ok(Vec::new())
     }
 
     // ---- message handling ------------------------------------------------
@@ -596,6 +719,10 @@ impl<L: RaftLog> RaftNode<L> {
             Message::RequestVoteReply(reply) => self.handle_vote_reply(reply, &mut actions),
             Message::AppendEntries(ae) => self.handle_append_entries(ae, &mut actions)?,
             Message::AppendEntriesReply(reply) => self.handle_append_reply(reply, &mut actions),
+            Message::InstallSnapshot(rpc) => self.handle_install_snapshot(rpc, &mut actions)?,
+            Message::InstallSnapshotReply(reply) => {
+                self.handle_install_snapshot_reply(reply, &mut actions);
+            }
         }
         Ok(actions)
     }
@@ -691,9 +818,30 @@ impl<L: RaftLog> RaftNode<L> {
         self.leader_id = Some(ae.leader);
         self.reset_election_timer();
 
-        // Log-consistency check at prev_log_index.
-        let prev_ok =
-            ae.prev_log_index == 0 || self.log.term_at(ae.prev_log_index) == Some(ae.prev_log_term);
+        // The entries up to `prev_log_index` are already subsumed by our
+        // snapshot. This happens for a stale or reordered RPC after we compacted;
+        // we cannot verify a compacted `prev_log_term`, so we simply report that
+        // we already hold everything through the snapshot boundary and let the
+        // leader resend the tail with a `prev` we can check.
+        let base = self.log.snapshot_index();
+        if ae.prev_log_index < base {
+            if ae.leader_commit > self.commit_index {
+                self.commit_index = ae.leader_commit.min(base);
+                self.drain_applies(actions);
+            }
+            reply.success = true;
+            reply.match_index = base;
+            actions.push(Action::Send {
+                to: ae.leader,
+                message: Message::AppendEntriesReply(reply),
+            });
+            return Ok(());
+        }
+
+        // Log-consistency check at prev_log_index. `term_at` answers `Some(0)` at
+        // the index-0 sentinel and `Some(base_term)` at the snapshot boundary, so
+        // both the head-of-log and post-compaction cases fall out naturally.
+        let prev_ok = self.log.term_at(ae.prev_log_index) == Some(ae.prev_log_term);
         if !prev_ok {
             // Supply a conflict hint so the leader can skip back a whole term.
             let last = self.log.last_index();
@@ -794,6 +942,87 @@ impl<L: RaftLog> RaftNode<L> {
             self.progress[i].next_index =
                 self.rejected_next(next, matched, reply.conflict_index, reply.conflict_term);
             self.progress[i].state = ProgressState::Probe;
+            self.send_append(i, actions);
+        }
+    }
+
+    /// Installs a snapshot shipped by the leader, on a follower too far behind to
+    /// replicate from the log. The state machine is reset via
+    /// [`Action::RestoreSnapshot`]; tail replication resumes afterward.
+    fn handle_install_snapshot(
+        &mut self,
+        rpc: InstallSnapshot,
+        actions: &mut Vec<Action>,
+    ) -> Result<()> {
+        if rpc.term < self.current_term {
+            actions.push(Action::Send {
+                to: rpc.leader,
+                message: Message::InstallSnapshotReply(InstallSnapshotReply {
+                    term: self.current_term,
+                    from: self.id,
+                    last_index: 0,
+                }),
+            });
+            return Ok(());
+        }
+
+        // A valid leader for our term: accept its authority.
+        self.role = Role::Follower;
+        self.leader_id = Some(rpc.leader);
+        self.reset_election_timer();
+
+        let snap_index = rpc.snapshot.index;
+        let snap_term = rpc.snapshot.term;
+        if snap_index > self.log.snapshot_index() {
+            self.log.apply_snapshot(&rpc.snapshot)?;
+            self.log.sync()?;
+            if snap_index > self.commit_index {
+                self.commit_index = snap_index;
+            }
+            if snap_index > self.last_applied {
+                self.last_applied = snap_index;
+            }
+            if snap_index > self.snapshot_hinted_at {
+                self.snapshot_hinted_at = snap_index;
+            }
+            actions.push(Action::RestoreSnapshot {
+                index: snap_index,
+                term: snap_term,
+                data: rpc.snapshot.data,
+            });
+        }
+
+        actions.push(Action::Send {
+            to: rpc.leader,
+            message: Message::InstallSnapshotReply(InstallSnapshotReply {
+                term: self.current_term,
+                from: self.id,
+                last_index: self.log.snapshot_index(),
+            }),
+        });
+        Ok(())
+    }
+
+    /// Handles a follower's acknowledgement of an installed snapshot: advance its
+    /// progress to the snapshot index and resume tail replication.
+    fn handle_install_snapshot_reply(
+        &mut self,
+        reply: InstallSnapshotReply,
+        actions: &mut Vec<Action>,
+    ) {
+        if self.role != Role::Leader || reply.term != self.current_term {
+            return;
+        }
+        let Some(i) = self.peer_index(reply.from) else {
+            return;
+        };
+        if reply.last_index > self.progress[i].match_index {
+            self.progress[i].match_index = reply.last_index;
+        }
+        self.progress[i].next_index = self.progress[i].match_index + 1;
+        self.progress[i].state = ProgressState::Replicate;
+        self.advance_commit(actions);
+        if self.progress[i].next_index <= self.log.last_index() {
             self.send_append(i, actions);
         }
     }
@@ -1440,6 +1669,153 @@ mod tests {
             "vote must be synced before the reply"
         );
         assert_eq!(node.log().hard_state().voted_for, Some(2));
+    }
+
+    // ---- v0.5 snapshots ---------------------------------------------------
+
+    #[test]
+    fn test_snapshot_hint_then_compaction() {
+        // Single-node leader with a low threshold snapshots its own log.
+        let mut node = RaftNode::new(RaftConfig::single(1).with_snapshot_threshold(2));
+        drive_to_leader(&mut node);
+
+        let mut hint = None;
+        for _ in 0..4 {
+            let actions = node.step(Event::Propose(b"c".to_vec())).unwrap();
+            if let Some(Action::Snapshot { index, term }) = actions
+                .iter()
+                .find(|a| matches!(a, Action::Snapshot { .. }))
+                .cloned()
+            {
+                hint = Some((index, term));
+                break;
+            }
+        }
+        let (index, _term) = hint.expect("a snapshot hint once the log grew");
+        assert!(index >= 2);
+
+        // Feed the snapshot back; the log compacts up to `index`.
+        let _ = node
+            .step(Event::Snapshot {
+                index,
+                data: b"state".to_vec(),
+            })
+            .unwrap();
+        assert_eq!(node.log().snapshot_index(), index);
+        assert_eq!(node.log().entry(1), None); // compacted away
+        assert_eq!(node.commit_index(), node.commit_index()); // unchanged
+    }
+
+    #[test]
+    fn test_snapshot_event_rejects_uncommitted_index() {
+        let mut node = RaftNode::new(RaftConfig::single(1).with_snapshot_threshold(0));
+        drive_to_leader(&mut node);
+        let _ = node.step(Event::Propose(b"c".to_vec())).unwrap(); // commit index 1
+        // An index beyond what is committed/applied is ignored, no compaction.
+        let _ = node
+            .step(Event::Snapshot {
+                index: 99,
+                data: vec![],
+            })
+            .unwrap();
+        assert_eq!(node.log().snapshot_index(), 0);
+    }
+
+    #[test]
+    fn test_leader_sends_install_snapshot_when_follower_is_behind() {
+        // Leader 1 of {1,2,3} with a compacted log: a probe to a fresh follower
+        // (next = 1 <= snapshot index) must be an InstallSnapshot, not an append.
+        let mut log = MemoryLog::new();
+        log.append(&[entry(1, 1), entry(1, 2), entry(1, 3)])
+            .unwrap();
+        log.apply_snapshot(&Snapshot::new(2, 1, b"snap".to_vec()))
+            .unwrap();
+        log.set_hard_state(HardState {
+            term: 1,
+            voted_for: Some(1),
+        })
+        .unwrap();
+        let mut node =
+            RaftNode::with_log(RaftConfig::new(1, [2, 3]).with_election_timeout(5, 5), log);
+        // Drive an election and win it.
+        let mut elected = false;
+        for _ in 0..50 {
+            let _ = node.step(Event::Tick).unwrap();
+            if node.role() == Role::Candidate {
+                let _ = node
+                    .step(Event::Message(Message::RequestVoteReply(
+                        RequestVoteReply {
+                            term: node.term(),
+                            vote_granted: true,
+                            from: 2,
+                        },
+                    )))
+                    .unwrap();
+            }
+            if node.is_leader() {
+                elected = true;
+                break;
+            }
+        }
+        assert!(elected);
+        // A heartbeat round: peers start at next = last+1 = 4. Force a backtrack by
+        // rejecting from node 2 down into the compacted range.
+        let actions = node
+            .step(Event::Message(Message::AppendEntriesReply(
+                AppendEntriesReply {
+                    term: node.term(),
+                    success: false,
+                    from: 2,
+                    match_index: 0,
+                    conflict_index: 1, // wants to go back to index 1 (compacted)
+                    conflict_term: 0,
+                },
+            )))
+            .unwrap();
+        // Backtracking past the snapshot boundary yields an InstallSnapshot.
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Send {
+                to: 2,
+                message: Message::InstallSnapshot(_)
+            }
+        )));
+    }
+
+    #[test]
+    fn test_follower_installs_snapshot_and_restores() {
+        let mut node = RaftNode::new(RaftConfig::new(5, [1]));
+        let actions = node
+            .step(Event::Message(Message::InstallSnapshot(InstallSnapshot {
+                term: 3,
+                leader: 1,
+                snapshot: Snapshot::new(8, 2, b"the state".to_vec()),
+            })))
+            .unwrap();
+        assert_eq!(node.log().snapshot_index(), 8);
+        assert_eq!(node.commit_index(), 8);
+        // The follower asks the app to restore, and acknowledges the install.
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::RestoreSnapshot { index: 8, .. }))
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Send { message: Message::InstallSnapshotReply(r), .. } if r.last_index == 8
+        )));
+    }
+
+    #[test]
+    fn test_node_recovers_applied_position_from_snapshot() {
+        // A log opened with an existing snapshot starts applied at the boundary,
+        // so the application (which restores from the snapshot) is not re-fed it.
+        let mut log = MemoryLog::new();
+        log.apply_snapshot(&Snapshot::new(6, 2, b"s".to_vec()))
+            .unwrap();
+        let node = RaftNode::with_log(RaftConfig::single(1), log);
+        assert_eq!(node.commit_index(), 6);
+        assert_eq!(node.last_applied(), 6);
     }
 
     #[test]

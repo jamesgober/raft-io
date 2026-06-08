@@ -47,7 +47,8 @@
 - **Pluggable transport** &mdash; `RaftTransport` trait; in-memory for tests, real net for production _(live)_
 - **Pluggable log store** &mdash; `RaftLog` trait; `wal-db`-backed `WalLog` under the `persistence` feature _(live in v0.4)_
 - **Crash recovery** &mdash; term, vote, and log persisted before each RPC; a restarted node recovers and rejoins without violating safety _(live in v0.4)_
-- **Snapshotting** &mdash; install-snapshot for log compaction and fast follower catch-up _(v0.5)_
+- **Snapshotting** &mdash; install-snapshot for log compaction and fast follower catch-up, driven by a snapshot-policy hint _(live in v0.5)_
+- **Typed framing** &mdash; `pack-io` wire encoding for messages under the `framing` feature _(live in v0.5)_
 - **Membership changes** &mdash; single-server add/remove via joint-consensus-safe reconfiguration _(v0.6)_
 
 
@@ -57,10 +58,11 @@
 
 ```toml
 [dependencies]
-raft-io = "0.4"
+raft-io = "0.5"
 
-# For a durable, crash-recoverable log (wal-db-backed `WalLog`):
-raft-io = { version = "0.4", features = ["persistence"] }
+# Optional features:
+raft-io = { version = "0.5", features = ["persistence"] } # durable wal-db-backed `WalLog`
+raft-io = { version = "0.5", features = ["framing"] }     # pack-io wire framing for messages
 ```
 
 <br>
@@ -107,6 +109,7 @@ cargo run --example single_node         # elect + propose + apply, one node
 cargo run --example in_memory_cluster   # a 3-node cluster electing a leader
 cargo run --example replicated_log      # propose + replicate; all nodes agree
 cargo run --example partition_recovery  # minority stalls, majority commits, heal
+cargo run --example snapshot_catchup    # leader compacts; lagging node catches up via snapshot
 cargo run --example persistent_node --features persistence  # log survives a restart
 ```
 
@@ -114,14 +117,15 @@ cargo run --example persistent_node --features persistence  # log survives a res
 
 ## Status
 
-This is `v0.4.0`: a correct, durable multi-node cluster. On top of v0.3's
-replication pipeline, the `persistence` feature adds `WalLog` — a
-`wal-db`-backed log whose entries and hard state (term, vote) are persisted
-before each RPC and recovered on restart. An adversarial property-test suite
-drives 3- and 5-node clusters through reordered, dropped, duplicated, and
-partitioned schedules — now with node crashes interleaved — and asserts that
-committed entries never diverge and a restarted node rejoins without violating
-safety. Snapshots and log compaction land in `v0.5`, per the
+This is `v0.5.0`: the protocol is feature-complete bar membership changes. On top
+of election, the replication pipeline, and durable crash recovery, this release
+adds **snapshots with log compaction** — a configurable policy hint asks the
+application to snapshot, the log compacts behind it, and a follower too far behind
+to replicate is caught up with an `InstallSnapshot` then tail replication. The
+`framing` feature adds `pack-io` wire encoding for messages. Adversarial property
+tests drive 3- and 5-node clusters through reordered, dropped, duplicated, and
+partitioned schedules — with node crashes and snapshots interleaved — and assert
+that committed entries never diverge. Membership changes land in `v0.6`, per the
 <a href="./.dev/ROADMAP.md"><code>ROADMAP</code></a> (development copy). The full
 public surface is documented in <a href="./docs/API.md"><code>docs/API.md</code></a>.
 

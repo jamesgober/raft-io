@@ -14,7 +14,7 @@
 //! the crate's own — no associated error type for callers to name.
 
 use crate::error::{Error, Result};
-use crate::types::{HardState, Index, LogEntry, Term};
+use crate::types::{HardState, Index, LogEntry, Snapshot, Term};
 
 /// Storage for a node's persistent state: its log entries and its
 /// [`HardState`].
@@ -133,6 +133,49 @@ pub trait RaftLog {
     ///
     /// Returns [`Error::Storage`] if the backend cannot make its writes durable.
     fn sync(&mut self) -> Result<()>;
+
+    /// Returns the index the log has been compacted up to — the last index a
+    /// snapshot includes — or `0` if there is no snapshot.
+    ///
+    /// Entries at or below this index are no longer individually available;
+    /// [`snapshot`](RaftLog::snapshot) covers them, and
+    /// [`term_at`](RaftLog::term_at) still answers for the boundary index itself.
+    /// Defaults to `0` for backends without snapshot support.
+    fn snapshot_index(&self) -> Index {
+        0
+    }
+
+    /// Returns the current snapshot, if one exists.
+    ///
+    /// A leader reads this to send a far-behind follower an `InstallSnapshot`
+    /// instead of replaying entries it has already compacted away. Defaults to
+    /// `None`.
+    fn snapshot(&self) -> Option<Snapshot> {
+        None
+    }
+
+    /// Installs `snapshot`, replacing the prefix it subsumes.
+    ///
+    /// Entries up to `snapshot.index` are discarded and the snapshot becomes the
+    /// log's new base. A matching tail — an entry at `snapshot.index` whose term
+    /// is `snapshot.term` — is preserved; otherwise the remaining entries are
+    /// cleared because the snapshot supersedes them. A snapshot no newer than the
+    /// current one is a no-op.
+    ///
+    /// The default implementation returns an error, so a backend that does not
+    /// support snapshots fails loudly rather than silently dropping compaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the backend does not support snapshots or
+    /// fails to store it.
+    fn apply_snapshot(&mut self, snapshot: &Snapshot) -> Result<()> {
+        let _ = snapshot;
+        Err(Error::storage(
+            "apply snapshot",
+            "this log does not support snapshots",
+        ))
+    }
 }
 
 /// An in-memory [`RaftLog`] backed by a `Vec`.
@@ -143,6 +186,11 @@ pub trait RaftLog {
 /// it is for tests, examples, and the single-node path, not production. Its
 /// operations never fail except on a misuse that would corrupt the log
 /// (a non-contiguous append or a `truncate(0)`).
+///
+/// After a snapshot is installed the log is compacted: entries up to the
+/// snapshot's index are dropped and `base_index` / `base_term` become the log's
+/// new starting boundary, so reads below the boundary return `None` while
+/// [`term_at`](RaftLog::term_at) still answers for the boundary index itself.
 ///
 /// # Examples
 ///
@@ -161,7 +209,14 @@ pub trait RaftLog {
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct MemoryLog {
+    /// Entries with index in `(base_index, base_index + entries.len()]`.
     entries: Vec<LogEntry>,
+    /// Index of the snapshot boundary (last included), or `0` if none.
+    base_index: Index,
+    /// Term at the snapshot boundary, or `0` if none.
+    base_term: Term,
+    /// Snapshot bytes, present once a snapshot has been installed.
+    snapshot: Option<Vec<u8>>,
     hard: HardState,
 }
 
@@ -214,37 +269,50 @@ impl MemoryLog {
     }
 }
 
+impl MemoryLog {
+    /// Slot in `entries` for `index`, if it is in range `(base_index, last]`.
+    #[inline]
+    fn slot(&self, index: Index) -> Option<usize> {
+        if index <= self.base_index || index > self.last_index() {
+            None
+        } else {
+            Some((index - self.base_index - 1) as usize)
+        }
+    }
+}
+
 impl RaftLog for MemoryLog {
     #[inline]
     fn last_index(&self) -> Index {
-        self.entries.len() as Index
+        self.base_index + self.entries.len() as Index
     }
 
     #[inline]
     fn last_term(&self) -> Term {
-        self.entries.last().map_or(0, |e| e.term)
+        self.entries.last().map_or(self.base_term, |e| e.term)
     }
 
     fn term_at(&self, index: Index) -> Option<Term> {
-        if index == 0 {
-            return Some(0);
+        if index == self.base_index {
+            return Some(self.base_term);
         }
-        self.entries.get((index - 1) as usize).map(|e| e.term)
+        self.slot(index).map(|s| self.entries[s].term)
     }
 
     fn entry(&self, index: Index) -> Option<LogEntry> {
-        if index == 0 {
-            return None;
-        }
-        self.entries.get((index - 1) as usize).cloned()
+        self.slot(index).map(|s| self.entries[s].clone())
     }
 
     fn entries(&self, from: Index, to: Index) -> Vec<LogEntry> {
-        if from == 0 || to < from {
+        if from == 0 {
             return Vec::new();
         }
-        let start = (from - 1) as usize;
-        let end = (to as usize).min(self.entries.len());
+        let from = from.max(self.base_index + 1);
+        if to < from {
+            return Vec::new();
+        }
+        let start = (from - self.base_index - 1) as usize;
+        let end = ((to - self.base_index) as usize).min(self.entries.len());
         if start >= end {
             return Vec::new();
         }
@@ -279,13 +347,13 @@ impl RaftLog for MemoryLog {
     }
 
     fn truncate(&mut self, from: Index) -> Result<()> {
-        if from == 0 {
+        if from <= self.base_index {
             return Err(Error::storage(
                 "truncate log",
-                "cannot truncate the sentinel at index 0",
+                "cannot truncate into the snapshot",
             ));
         }
-        let keep = (from - 1) as usize;
+        let keep = (from - self.base_index - 1) as usize;
         if keep < self.entries.len() {
             self.entries.truncate(keep);
         }
@@ -305,6 +373,35 @@ impl RaftLog for MemoryLog {
 
     #[inline]
     fn sync(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    #[inline]
+    fn snapshot_index(&self) -> Index {
+        self.base_index
+    }
+
+    fn snapshot(&self) -> Option<Snapshot> {
+        self.snapshot
+            .as_ref()
+            .map(|data| Snapshot::new(self.base_index, self.base_term, data.clone()))
+    }
+
+    fn apply_snapshot(&mut self, snapshot: &Snapshot) -> Result<()> {
+        // A snapshot no newer than the one we hold tells us nothing.
+        if snapshot.index <= self.base_index {
+            return Ok(());
+        }
+        // Keep the tail only if our log agrees with the snapshot at its boundary.
+        if self.term_at(snapshot.index) == Some(snapshot.term) {
+            let drop = ((snapshot.index - self.base_index) as usize).min(self.entries.len());
+            let _ = self.entries.drain(0..drop);
+        } else {
+            self.entries.clear();
+        }
+        self.base_index = snapshot.index;
+        self.base_term = snapshot.term;
+        self.snapshot = Some(snapshot.data.clone());
         Ok(())
     }
 }
@@ -472,5 +569,118 @@ mod tests {
     #[test]
     fn test_sync_is_ok() {
         assert!(MemoryLog::new().sync().is_ok());
+    }
+
+    // ---- compaction / snapshots -------------------------------------------
+
+    #[test]
+    fn test_apply_snapshot_compacts_and_keeps_matching_tail() {
+        let mut log = MemoryLog::new();
+        log.append(&[entry(1, 1), entry(1, 2), entry(2, 3), entry(2, 4)])
+            .unwrap();
+        // Snapshot through index 2 (term 1) — our log matches there, keep the tail.
+        log.apply_snapshot(&Snapshot::new(2, 1, b"state@2".to_vec()))
+            .unwrap();
+
+        assert_eq!(log.snapshot_index(), 2);
+        assert_eq!(log.last_index(), 4);
+        // Compacted entries are gone, the boundary term is still answerable.
+        assert_eq!(log.entry(1), None);
+        assert_eq!(log.entry(2), None);
+        assert_eq!(log.term_at(2), Some(1)); // boundary
+        assert_eq!(log.term_at(1), None); // below boundary
+        // The tail survived.
+        assert_eq!(log.entry(3).unwrap().term, 2);
+        assert_eq!(log.entry(4).unwrap().index, 4);
+        // The snapshot is retrievable.
+        assert_eq!(log.snapshot().unwrap().data, b"state@2");
+    }
+
+    #[test]
+    fn test_apply_snapshot_clears_log_on_mismatch() {
+        let mut log = MemoryLog::new();
+        log.append(&[entry(1, 1), entry(1, 2)]).unwrap();
+        // A snapshot at index 5 our log cannot match supersedes everything.
+        log.apply_snapshot(&Snapshot::new(5, 3, b"state@5".to_vec()))
+            .unwrap();
+        assert_eq!(log.snapshot_index(), 5);
+        assert_eq!(log.last_index(), 5);
+        assert_eq!(log.last_term(), 3);
+        assert!(log.entries(1, 5).is_empty());
+        assert_eq!(log.term_at(5), Some(3));
+    }
+
+    #[test]
+    fn test_append_continues_after_snapshot() {
+        let mut log = MemoryLog::new();
+        log.apply_snapshot(&Snapshot::new(7, 2, b"base".to_vec()))
+            .unwrap();
+        assert_eq!(log.last_index(), 7);
+        // Next append must be contiguous with the snapshot boundary.
+        assert!(log.append(&[entry(2, 7)]).is_err()); // 7 already covered
+        log.append(&[entry(3, 8), entry(3, 9)]).unwrap();
+        assert_eq!(log.last_index(), 9);
+        assert_eq!(log.entry(8).unwrap().term, 3);
+        assert_eq!(log.term_at(7), Some(2)); // boundary term preserved
+    }
+
+    #[test]
+    fn test_stale_snapshot_is_ignored() {
+        let mut log = MemoryLog::new();
+        log.apply_snapshot(&Snapshot::new(5, 2, b"new".to_vec()))
+            .unwrap();
+        log.apply_snapshot(&Snapshot::new(3, 1, b"old".to_vec()))
+            .unwrap();
+        assert_eq!(log.snapshot_index(), 5);
+        assert_eq!(log.snapshot().unwrap().data, b"new");
+    }
+
+    #[test]
+    fn test_truncate_into_snapshot_is_rejected() {
+        let mut log = MemoryLog::new();
+        log.apply_snapshot(&Snapshot::new(5, 2, b"s".to_vec()))
+            .unwrap();
+        assert!(log.truncate(5).is_err());
+        assert!(log.truncate(3).is_err());
+    }
+
+    #[test]
+    fn test_default_apply_snapshot_errors() {
+        // The trait's default `apply_snapshot` rejects, so a snapshot-unaware
+        // backend fails loudly.
+        struct NoSnap(MemoryLog);
+        impl RaftLog for NoSnap {
+            fn last_index(&self) -> Index {
+                self.0.last_index()
+            }
+            fn last_term(&self) -> Term {
+                self.0.last_term()
+            }
+            fn term_at(&self, index: Index) -> Option<Term> {
+                self.0.term_at(index)
+            }
+            fn entry(&self, index: Index) -> Option<LogEntry> {
+                self.0.entry(index)
+            }
+            fn append(&mut self, entries: &[LogEntry]) -> Result<()> {
+                self.0.append(entries)
+            }
+            fn truncate(&mut self, from: Index) -> Result<()> {
+                self.0.truncate(from)
+            }
+            fn hard_state(&self) -> HardState {
+                self.0.hard_state()
+            }
+            fn set_hard_state(&mut self, state: HardState) -> Result<()> {
+                self.0.set_hard_state(state)
+            }
+            fn sync(&mut self) -> Result<()> {
+                self.0.sync()
+            }
+        }
+        let mut log = NoSnap(MemoryLog::new());
+        assert_eq!(log.snapshot_index(), 0);
+        assert!(log.snapshot().is_none());
+        assert!(log.apply_snapshot(&Snapshot::new(1, 1, vec![])).is_err());
     }
 }

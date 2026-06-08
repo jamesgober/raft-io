@@ -75,6 +75,7 @@ pub enum Role {
 /// assert_eq!(entry.command, b"put k v");
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "framing", derive(pack_io::Serialize, pack_io::Deserialize))]
 pub struct LogEntry {
     /// Term in which the leader created this entry.
     pub term: Term,
@@ -128,6 +129,56 @@ pub struct HardState {
     pub term: Term,
     /// The candidate this node voted for in `term`, if any.
     pub voted_for: Option<NodeId>,
+}
+
+/// A point-in-time capture of the application's state machine, with the log
+/// position it covers.
+///
+/// A snapshot lets the log discard the entries it subsumes (compaction) and lets
+/// a leader catch up a follower that has fallen too far behind to replicate
+/// entry by entry. [`index`](Snapshot::index) and [`term`](Snapshot::term) are
+/// the last log entry the snapshot includes — its replacement "sentinel" once
+/// the entries up to there are gone — and [`data`](Snapshot::data) is the opaque
+/// serialized state the application produces and restores. The protocol moves
+/// the bytes but never interprets them.
+///
+/// # Examples
+///
+/// ```
+/// use raft_io::Snapshot;
+///
+/// let snap = Snapshot::new(10, 3, b"serialized state".to_vec());
+/// assert_eq!(snap.index, 10);
+/// assert_eq!(snap.term, 3);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "framing", derive(pack_io::Serialize, pack_io::Deserialize))]
+pub struct Snapshot {
+    /// Index of the last log entry the snapshot includes.
+    pub index: Index,
+    /// Term of the last log entry the snapshot includes.
+    pub term: Term,
+    /// Opaque serialized state machine state. The protocol never inspects it.
+    pub data: Vec<u8>,
+}
+
+impl Snapshot {
+    /// Creates a snapshot covering the log through `index` (created in `term`),
+    /// carrying serialized state `data`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use raft_io::Snapshot;
+    ///
+    /// let snap = Snapshot::new(5, 2, vec![1, 2, 3]);
+    /// assert_eq!(snap.data, vec![1, 2, 3]);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn new(index: Index, term: Term, data: Vec<u8>) -> Self {
+        Self { index, term, data }
+    }
 }
 
 #[cfg(test)]

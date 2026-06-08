@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1683202def9dfa6772b4eb8343b82a69d5ecd4c958382cef412cc892f66a5dab # shrinks to ops = [Tick(66), Tick(204), Tick(24), Tick(24), Tick(177), Tick(24), Tick(21), Tick(189), Tick(54), Tick(33), Tick(63), Tick(24), Tick(21), Deliver(0), Deliver(3870), Deliver(0), Tick(108), Tick(45), Propose, Deliver(11082), Propose, Deliver(4386), Deliver(4057), Propose, Tick(33), Partition(41), Deliver(43726), Deliver(182), Deliver(62247), Tick(159), Deliver(9016), Deliver(48226), Tick(237), Tick(30), Propose, Tick(123), Heal, Tick(123), Propose, Deliver(45352), Deliver(55787), Deliver(38714), Deliver(60569), Deliver(9382), Deliver(10155), Tick(201), Deliver(10623), Deliver(22338), Propose, Propose, Propose, Deliver(10543), Propose, Partition(157), Deliver(10878), Deliver(15297), Deliver(22810), Deliver(6879), Heal, Deliver(54384)]

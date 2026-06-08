@@ -16,7 +16,7 @@
 
 > Complete reference for every public item in `raft-io`, with examples.
 >
-> **Status: pre-1.0 (`v0.4`).** This document tracks the API surface as it lands
+> **Status: pre-1.0 (`v0.5`).** This document tracks the API surface as it lands
 > across the 0.x series. The wire protocol and trait seams are frozen at `1.0`.
 > Sections marked _(planned: vX.Y)_ describe a surface a later phase introduces.
 
@@ -27,15 +27,15 @@
 - [Quick Start](#quick-start)
 - [The three tiers](#the-three-tiers)
 - [Public API](#public-api)
-  - [Value types](#value-types) — [`NodeId`](#nodeid--term--index), [`Term`](#nodeid--term--index), [`Index`](#nodeid--term--index), [`Role`](#role), [`LogEntry`](#logentry), [`HardState`](#hardstate)
+  - [Value types](#value-types) — [`NodeId`](#nodeid--term--index), [`Term`](#nodeid--term--index), [`Index`](#nodeid--term--index), [`Role`](#role), [`LogEntry`](#logentry), [`HardState`](#hardstate), [`Snapshot`](#snapshot)
   - [`RaftConfig`](#raftconfig)
   - [`RaftNode`](#raftnode)
   - [`Event`](#event)
   - [`Action`](#action)
-  - [Messages](#messages) — [`Message`](#message), [`RequestVote`](#requestvote), [`RequestVoteReply`](#requestvotereply), [`AppendEntries`](#appendentries), [`AppendEntriesReply`](#appendentriesreply)
+  - [Messages](#messages) — [`Message`](#message), [`RequestVote`](#requestvote), [`RequestVoteReply`](#requestvotereply), [`AppendEntries`](#appendentries), [`AppendEntriesReply`](#appendentriesreply), [`InstallSnapshot`](#installsnapshot), [`InstallSnapshotReply`](#installsnapshotreply)
   - [`RaftLog`](#raftlog), [`MemoryLog`](#memorylog) & [`WalLog`](#wallog)
   - [`RaftTransport`](#rafttransport) & [`MemoryTransport`](#memorytransport)
-  - [`Error`](#error) & [`Result`](#result)
+  - [`Error`](#error), [`Result`](#result) & [`framing`](#framing)
 - [Feature flags](#feature-flags)
 
 ---
@@ -52,13 +52,16 @@ storage are injected through the [`RaftLog`](#raftlog) and
 [`RaftTransport`](#rafttransport) seams. That separation is what makes the core
 provable — an entire run is reproducible from a seed and a sequence of events.
 
-At `v0.4` the implemented surface is leader election with full term and vote
-safety, the complete multi-node log-replication pipeline (batched
-[`AppendEntries`](#appendentries), per-follower progress with optimistic
-pipelining, conflict-hint backtracking, commit on a quorum), and **durable
-persistence**: [`WalLog`](#wallog), a `wal-db`-backed [`RaftLog`](#raftlog) under
-the `persistence` feature whose entries and hard state survive a restart.
-Snapshots and log compaction are `v0.5`.
+At `v0.5` the protocol is feature-complete bar membership changes (`v0.6`): leader
+election with full term and vote safety, the complete multi-node
+log-replication pipeline (batched [`AppendEntries`](#appendentries), per-follower
+progress with optimistic pipelining, conflict-hint backtracking, commit on a
+quorum), durable persistence and crash recovery ([`WalLog`](#wallog), `persistence`
+feature), and **snapshots with log compaction** — a policy hint
+([`Action::Snapshot`](#action)) drives the application to snapshot, the log
+compacts behind it, and a follower too far behind to replicate is caught up with
+an [`InstallSnapshot`](#installsnapshot). The `framing` feature adds
+[`pack-io`](#framing) wire encoding for messages.
 
 ---
 
@@ -66,10 +69,11 @@ Snapshots and log compaction are `v0.5`.
 
 ```toml
 [dependencies]
-raft-io = "0.4"
+raft-io = "0.5"
 
-# Durable, crash-recoverable log (wal-db-backed `WalLog`):
-raft-io = { version = "0.4", features = ["persistence"] }
+# Optional features:
+raft-io = { version = "0.5", features = ["persistence"] } # durable wal-db-backed `WalLog`
+raft-io = { version = "0.5", features = ["framing"] }     # pack-io wire framing for messages
 ```
 
 MSRV: Rust 1.85 (edition 2024).
@@ -99,6 +103,7 @@ cargo run --example single_node         # elect + propose + apply, one node
 cargo run --example in_memory_cluster   # a 3-node cluster electing a leader
 cargo run --example replicated_log      # propose + replicate; all nodes agree
 cargo run --example partition_recovery  # minority stalls, majority commits, heal
+cargo run --example snapshot_catchup    # leader compacts; lagging node catches up via snapshot
 cargo run --example persistent_node --features persistence  # log survives a restart
 ```
 
@@ -222,6 +227,29 @@ assert_eq!(hs.term, 4);
 assert_eq!(HardState::default().voted_for, None);
 ```
 
+#### `Snapshot`
+
+```rust
+pub struct Snapshot {
+    pub index: Index,
+    pub term: Term,
+    pub data: Vec<u8>,
+}
+```
+
+A point-in-time capture of the application's state machine plus the log position
+it covers. `index` / `term` are the last entry the snapshot includes — the
+log's replacement boundary once earlier entries are compacted away — and `data`
+is the opaque serialized state the application produces and restores. Build one
+with `Snapshot::new(index, term, data)`.
+
+```rust
+use raft_io::Snapshot;
+
+let snap = Snapshot::new(10, 3, b"serialized state".to_vec());
+assert_eq!((snap.index, snap.term), (10, 3));
+```
+
 ---
 
 ### `RaftConfig`
@@ -244,11 +272,12 @@ the caller decides how often to tick.
 | <a id="with_election_timeout"></a>`with_election_timeout` | `fn with_election_timeout(self, min: u32, max: u32) -> Self` | Randomised election-timeout bounds, in ticks. The spread breaks split votes. Normalised so `min >= 1` and `max >= min`. |
 | <a id="with_heartbeat_interval"></a>`with_heartbeat_interval` | `fn with_heartbeat_interval(self, interval: u32) -> Self` | Ticks between leader heartbeats. Keep it well below the election-timeout minimum. Normalised to `>= 1`. |
 | <a id="with_max_batch"></a>`with_max_batch` | `fn with_max_batch(self, max_batch: usize) -> Self` | Maximum entries carried by one `AppendEntries`. Bounds message size and per-RPC work so a far-behind follower is caught up in steady chunks. Normalised to `>= 1`. Default `64`. |
+| <a id="with_snapshot_threshold"></a>`with_snapshot_threshold` | `fn with_snapshot_threshold(self, threshold: usize) -> Self` | How many applied entries may accumulate beyond the last snapshot before the node emits an [`Action::Snapshot`](#action) hint. `0` (the default) disables snapshotting. |
 | <a id="with_seed"></a>`with_seed` | `fn with_seed(self, seed: u64) -> Self` | Seed for the deterministic election-timeout RNG. Give peers distinct seeds (the default is the node id). |
 
 **Accessors:** `id() -> NodeId`, `peers() -> &[NodeId]`,
 `election_timeout() -> (u32, u32)`, `heartbeat_interval() -> u32`,
-`max_batch() -> usize`, `seed() -> u64`.
+`max_batch() -> usize`, `snapshot_threshold() -> usize`, `seed() -> u64`.
 
 ```rust
 use raft_io::RaftConfig;
@@ -391,16 +420,20 @@ pub enum Event {
     Tick,
     Message(Message),
     Propose(Vec<u8>),
+    Snapshot { index: Index, data: Vec<u8> },
 }
 ```
 
-The input to [`step`](#step). A node only changes state in response to an event,
-and there are exactly three — Raft's three sources of progress:
+The input to [`step`](#step). A node only changes state in response to an event:
 
 - **`Tick`** — one logical clock tick. The caller picks the wall-clock interval.
 - **`Message(Message)`** — a message arrived from a peer.
 - **`Propose(Vec<u8>)`** — a client proposes a command. Only a leader may accept
   it; elsewhere [`step`](#step) returns [`Error::NotLeader`](#error).
+- **`Snapshot { index, data }`** — the reply to an [`Action::Snapshot`](#action)
+  hint: the application has serialized its state through `index` into `data`. The
+  node compacts the log up to `index`. A snapshot for an uncommitted or stale
+  index is ignored.
 
 ```rust
 use raft_io::{Event, Message, RequestVote};
@@ -421,6 +454,8 @@ let _msg = Event::Message(Message::RequestVote(RequestVote {
 pub enum Action {
     Send { to: NodeId, message: Message },
     Apply { index: Index, term: Term, command: Vec<u8> },
+    Snapshot { index: Index, term: Term },
+    RestoreSnapshot { index: Index, term: Term, data: Vec<u8> },
 }
 ```
 
@@ -431,9 +466,14 @@ What [`step`](#step) returns for the caller to carry out. The node decides
 - **`Apply { index, term, command }`** — apply a committed command to the state
   machine. Applies are emitted in strictly increasing index order, each index
   once, so they can be applied blindly in sequence.
+- **`Snapshot { index, term }`** — take a snapshot of the state machine through
+  `index` and return it via [`Event::Snapshot`](#event). Emitted when the log
+  grows past [`with_snapshot_threshold`](#with_snapshot_threshold).
+- **`RestoreSnapshot { index, term, data }`** — reset the state machine to an
+  installed snapshot (on a follower that received a leader's snapshot). Subsequent
+  `Apply` actions resume from `index + 1`.
 
-`#[non_exhaustive]`: a snapshot action joins it in `v0.5`, so a `match` must
-include a wildcard arm.
+`#[non_exhaustive]`: a `match` must include a wildcard arm.
 
 ```rust
 use raft_io::{Action, Event, RaftConfig, RaftNode};
@@ -472,11 +512,12 @@ pub enum Message {
     RequestVoteReply(RequestVoteReply),
     AppendEntries(AppendEntries),
     AppendEntriesReply(AppendEntriesReply),
+    InstallSnapshot(InstallSnapshot),
+    InstallSnapshotReply(InstallSnapshotReply),
 }
 ```
 
-Wraps the two RPCs and their replies. `#[non_exhaustive]` (`InstallSnapshot`
-joins it in `v0.5`).
+Wraps the RPCs and their replies. `#[non_exhaustive]` — match with a wildcard arm.
 
 **Method** — `term(&self) -> Term` returns the term carried by any variant,
 which the protocol checks first on every inbound message.
@@ -558,6 +599,35 @@ the `conflict_index` / `conflict_term` pair lets the leader skip its
 decrementing one entry at a time (the fast-backtracking optimisation). Both are
 `0` on success.
 
+#### `InstallSnapshot`
+
+```rust
+pub struct InstallSnapshot {
+    pub term: Term,
+    pub leader: NodeId,
+    pub snapshot: Snapshot,
+}
+```
+
+The leader's transfer of a [`Snapshot`](#snapshot) to a follower too far behind
+to replicate entry by entry — its next required entry has been compacted out of
+the leader's log. The follower installs the snapshot (replacing its state through
+`snapshot.index`, via [`Action::RestoreSnapshot`](#action)) and resumes tail
+replication.
+
+#### `InstallSnapshotReply`
+
+```rust
+pub struct InstallSnapshotReply {
+    pub term: Term,
+    pub from: NodeId,
+    pub last_index: Index,
+}
+```
+
+A follower's acknowledgement. `last_index` is the snapshot index the follower has
+installed, which the leader uses to advance that follower's replication progress.
+
 ```rust
 use raft_io::{AppendEntries, Message};
 
@@ -589,6 +659,9 @@ pub trait RaftLog {
     fn hard_state(&self) -> HardState;
     fn set_hard_state(&mut self, state: HardState) -> Result<()>;
     fn sync(&mut self) -> Result<()>;
+    fn snapshot_index(&self) -> Index;              // has a default impl (0)
+    fn snapshot(&self) -> Option<Snapshot>;         // has a default impl (None)
+    fn apply_snapshot(&mut self, s: &Snapshot) -> Result<()>; // default: error
 }
 ```
 
@@ -596,14 +669,17 @@ pub trait RaftLog {
 |---|---|
 | `last_index` | Index of the last entry, or `0` if empty. |
 | `last_term` | Term of the last entry, or `0` if empty. |
-| `term_at(index)` | Term at `index`; `Some(0)` for the sentinel `0`, `None` past the end. |
-| `entry(index)` | The entry at `index`, or `None`. |
+| `term_at(index)` | Term at `index`; `Some(0)` for the sentinel `0`, `Some(base_term)` at a snapshot boundary, `None` below it or past the end. |
+| `entry(index)` | The entry at `index`, or `None` (including compacted indices). |
 | `entries(from, to)` | Entries in the inclusive range `[from, to]` (the leader's replication batch). Has a default impl over `entry`; override for a bulk read. |
 | `append(entries)` | Append entries; the first index must be `last_index() + 1` and the batch contiguous. |
-| `truncate(from)` | Remove every entry with index `>= from` (`from >= 1`). |
+| `truncate(from)` | Remove every entry with index `>= from` (`from` must be above the snapshot boundary). |
 | `hard_state` | The persisted [`HardState`](#hardstate). |
 | `set_hard_state(state)` | Persist a new hard state. |
 | `sync` | Flush preceding writes to durable storage. |
+| `snapshot_index` | The index the log is compacted up to (`0` if none). Default `0`. |
+| `snapshot` | The current [`Snapshot`](#snapshot), if any. Default `None`. |
+| `apply_snapshot(s)` | Install a snapshot, compacting the prefix it subsumes (keeping a matching tail). The default errors, so a snapshot-unaware backend fails loudly. |
 
 **Durability contract.** A backend may buffer writes, but once `sync` returns
 `Ok`, every preceding `append`, `truncate`, and `set_hard_state` must be durable.
@@ -739,6 +815,7 @@ assert!(tx.take().is_empty()); // draining leaves it empty
 pub enum Error {
     NotLeader { leader: Option<NodeId> },
     Storage { context: &'static str, detail: String },
+    Encoding { context: &'static str, detail: String },
 }
 ```
 
@@ -751,10 +828,12 @@ severity (`is_retryable` / `is_fatal`) metadata, and is an ordinary
 |---|---|---|
 | `NotLeader { leader }` | A proposal reached a non-leader. `leader` is the best-known leader for the caller to redirect to (`None` during an election). | Retryable, not fatal. |
 | `Storage { context, detail }` | A [`RaftLog`](#raftlog) backend operation failed. `context` names the operation; `detail` is the backend's message. | Fatal, not retryable. |
+| `Encoding { context, detail }` | A message failed to [encode or decode](#framing) (the `framing` feature). | Not fatal — drop the malformed message. |
 
-<a id="error-helpers"></a>**Helper** — `Error::storage(context, source)` builds a
-`Storage` error from any `Display` source, so backends map their errors without
-naming the fields.
+<a id="error-helpers"></a>**Helpers** — `Error::storage(context, source)` and
+`Error::encoding(context, source)` build the respective error from any `Display`
+source, so backends and the framing layer map their errors without naming the
+fields.
 
 ```rust
 use raft_io::Error;
@@ -777,16 +856,42 @@ signatures read `Result<T>`.
 
 ---
 
+### `framing`
+
+_Requires the `framing` feature._
+
+Typed wire encoding for [`Message`](#message), built on `pack-io`. The protocol
+emits [`Action::Send`](#action) carrying a `Message` and leaves delivery to you;
+this module supplies the codec when your transport needs one. The message types
+derive `pack_io::Serialize` / `Deserialize` under the feature.
+
+| Function | Signature | Description |
+|---|---|---|
+| `encode` | `fn encode(message: &Message) -> Result<Vec<u8>>` | Serialize a message to wire bytes. |
+| `decode` | `fn decode(bytes: &[u8]) -> Result<Message>` | Read a message back. A failure is [`Error::Encoding`](#error) — treat it like a dropped message, not a crash. |
+
+```rust
+# #[cfg(feature = "framing")] {
+use raft_io::{framing, Message, RequestVote};
+
+let msg = Message::RequestVote(RequestVote {
+    term: 4, candidate: 2, last_log_index: 9, last_log_term: 3,
+});
+let bytes = framing::encode(&msg).unwrap();
+assert_eq!(framing::decode(&bytes).unwrap(), msg);
+# }
+```
+
+---
+
 ## Feature flags
 
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `persistence` | no | Adds [`WalLog`](#wallog), a durable `wal-db`-backed [`RaftLog`](#raftlog). The in-memory path is unaffected when off. |
+| `framing` | no | Adds [`framing`](#framing) — `pack-io` wire encoding for [`Message`](#message). Derives `pack_io` traits on the message types. |
 
-One more flag is reserved for a later phase and is not yet present on the crate,
-because an optional dependency without a code path that uses it would be dead
-weight: **`framing`** (typed RPC/message framing via `pack-io`) lands in `v0.5`.
-It will be purely additive.
+All flags are additive; the protocol is unchanged when they are off.
 
 ---
 

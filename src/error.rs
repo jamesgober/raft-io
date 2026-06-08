@@ -73,6 +73,21 @@ pub enum Error {
         /// The underlying backend error, rendered as text.
         detail: String,
     },
+
+    /// A message failed to encode to or decode from its wire form.
+    ///
+    /// Produced by the `framing` module (the `framing` feature) when
+    /// `pack-io` cannot serialize a message or a received byte string does not
+    /// decode into a valid one. `context` names the operation and `detail`
+    /// carries the codec's description. A decode failure is not fatal — the
+    /// transport should drop the malformed message and carry on, exactly as Raft
+    /// tolerates a lost one.
+    Encoding {
+        /// What the framing layer was doing when it failed.
+        context: &'static str,
+        /// The underlying codec error, rendered as text.
+        detail: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -87,6 +102,9 @@ impl fmt::Display for Error {
             Self::Storage { context, detail } => {
                 write!(f, "log storage error while {context}: {detail}")
             }
+            Self::Encoding { context, detail } => {
+                write!(f, "message framing error while {context}: {detail}")
+            }
         }
     }
 }
@@ -98,6 +116,7 @@ impl ForgeError for Error {
         match self {
             Self::NotLeader { .. } => "NotLeader",
             Self::Storage { .. } => "Storage",
+            Self::Encoding { .. } => "Encoding",
         }
     }
 
@@ -105,6 +124,7 @@ impl ForgeError for Error {
         match self {
             Self::NotLeader { .. } => "Not the leader",
             Self::Storage { .. } => "Log storage failure",
+            Self::Encoding { .. } => "Message framing failure",
         }
     }
 
@@ -140,6 +160,25 @@ impl Error {
     #[must_use]
     pub fn storage(context: &'static str, source: impl fmt::Display) -> Self {
         Self::Storage {
+            context,
+            detail: source.to_string(),
+        }
+    }
+
+    /// Builds an [`Encoding`](Error::Encoding) error from any displayable codec
+    /// error. Used by the `framing` layer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use raft_io::Error;
+    ///
+    /// let err = Error::encoding("decode message", "unexpected end of input");
+    /// assert!(err.to_string().contains("unexpected end of input"));
+    /// ```
+    #[must_use]
+    pub fn encoding(context: &'static str, source: impl fmt::Display) -> Self {
+        Self::Encoding {
             context,
             detail: source.to_string(),
         }

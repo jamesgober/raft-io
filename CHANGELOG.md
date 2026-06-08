@@ -19,6 +19,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.5.0] - 2026-06-08
+
+Snapshots and log compaction, plus typed wire framing. A node can now bound its
+log growth by snapshotting its state machine, and a follower too far behind to
+replicate is caught up with an `InstallSnapshot`. The protocol is feature-complete
+except for membership changes.
+
+### Added
+
+- Snapshots and log compaction. The `RaftLog` trait gains `snapshot`,
+  `apply_snapshot`, and `snapshot_index`; `MemoryLog` and `WalLog` implement them,
+  compacting the log behind a snapshot boundary (`base_index` / `base_term`).
+- Snapshot-policy hint: `RaftConfig::with_max_batch`'s sibling
+  `with_snapshot_threshold` (default `0` = disabled). When the applied log grows
+  past the threshold the node emits an `Action::Snapshot` hint; the application
+  serializes its state and returns it via `Event::Snapshot`, and the log compacts.
+- `InstallSnapshot` / `InstallSnapshotReply` RPCs (new `Message` variants): the
+  leader ships its snapshot to a follower whose next entry has been compacted
+  away. The follower installs it (`Action::RestoreSnapshot` resets the state
+  machine) and resumes tail replication.
+- `Snapshot` value type (index, term, opaque data).
+- `WalLog` snapshot durability: a snapshot record is persisted and the WAL is
+  physically compacted (earlier records dropped, current hard state re-persisted),
+  so the file stays bounded.
+- `framing` feature: `framing::encode` / `framing::decode` for `Message`, built
+  on `pack-io`; the message types derive `pack_io::Serialize` / `Deserialize`.
+- `Error::Encoding` variant for framing failures.
+- Snapshot test suite (`tests/snapshot.rs`): a lagging follower caught up via
+  snapshot then tail, compaction-never-exceeds-applied, and an adversarial
+  proptest with snapshots and partitions asserting no divergence. Plus
+  `framing` round-trip tests for every message variant and node/log unit tests.
+- `snapshot_catchup` example.
+
+### Changed
+
+- `Message` gains `InstallSnapshot` / `InstallSnapshotReply` variants. The follower
+  log-consistency check now accounts for a compacted boundary, fixing a
+  non-contiguous-append path a stale post-compaction RPC could otherwise trigger.
+
+---
+
 ## [0.4.0] - 2026-06-08
 
 Durable persistence and crash recovery. A node can now back its log with a
@@ -147,7 +188,8 @@ Initial scaffold and repository bootstrap. No raft-io logic yet &mdash; this rel
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/raft-io/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/raft-io/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/raft-io/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/raft-io/compare/v0.1.0...v0.2.0

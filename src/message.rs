@@ -13,7 +13,7 @@
 //! replication pipeline — arrives in `v0.3`; the fields are already present so
 //! the wire shape does not change underneath callers.
 
-use crate::types::{Index, LogEntry, NodeId, Term};
+use crate::types::{Index, LogEntry, NodeId, Snapshot, Term};
 
 /// A candidate's request for a vote in an election.
 ///
@@ -32,6 +32,7 @@ use crate::types::{Index, LogEntry, NodeId, Term};
 /// assert_eq!(rv.candidate, 2);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "framing", derive(pack_io::Serialize, pack_io::Deserialize))]
 pub struct RequestVote {
     /// The candidate's term.
     pub term: Term,
@@ -58,6 +59,7 @@ pub struct RequestVote {
 /// assert!(reply.vote_granted);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "framing", derive(pack_io::Serialize, pack_io::Deserialize))]
 pub struct RequestVoteReply {
     /// The responder's current term, for the candidate to update itself.
     pub term: Term,
@@ -93,6 +95,7 @@ pub struct RequestVoteReply {
 /// assert!(hb.entries.is_empty());
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "framing", derive(pack_io::Serialize, pack_io::Deserialize))]
 pub struct AppendEntries {
     /// The leader's term.
     pub term: Term,
@@ -135,6 +138,7 @@ pub struct AppendEntries {
 /// assert!(ok.success);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "framing", derive(pack_io::Serialize, pack_io::Deserialize))]
 pub struct AppendEntriesReply {
     /// The follower's current term, for the leader to update itself.
     pub term: Term,
@@ -153,12 +157,63 @@ pub struct AppendEntriesReply {
     pub conflict_term: Term,
 }
 
+/// A leader's transfer of a [`Snapshot`] to a follower too far behind to
+/// replicate entry by entry.
+///
+/// When a follower's next required entry has already been compacted out of the
+/// leader's log, the leader sends this instead of an [`AppendEntries`]. The
+/// follower installs the snapshot — replacing its state through
+/// `snapshot.index` — then resumes normal replication from the tail.
+///
+/// # Examples
+///
+/// ```
+/// use raft_io::{InstallSnapshot, Snapshot};
+///
+/// let rpc = InstallSnapshot { term: 5, leader: 1, snapshot: Snapshot::new(10, 3, vec![]) };
+/// assert_eq!(rpc.snapshot.index, 10);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "framing", derive(pack_io::Serialize, pack_io::Deserialize))]
+pub struct InstallSnapshot {
+    /// The leader's term.
+    pub term: Term,
+    /// The leader sending the snapshot.
+    pub leader: NodeId,
+    /// The snapshot to install.
+    pub snapshot: Snapshot,
+}
+
+/// A follower's response to an [`InstallSnapshot`].
+///
+/// `last_index` is the snapshot's index the follower has now installed, which
+/// the leader uses to advance that follower's replication progress.
+///
+/// # Examples
+///
+/// ```
+/// use raft_io::InstallSnapshotReply;
+///
+/// let reply = InstallSnapshotReply { term: 5, from: 2, last_index: 10 };
+/// assert_eq!(reply.last_index, 10);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "framing", derive(pack_io::Serialize, pack_io::Deserialize))]
+pub struct InstallSnapshotReply {
+    /// The follower's current term, for the leader to update itself.
+    pub term: Term,
+    /// The node that produced this reply.
+    pub from: NodeId,
+    /// The snapshot index the follower has installed.
+    pub last_index: Index,
+}
+
 /// Any message a node can send or receive.
 ///
-/// Wraps the two RPCs and their replies. The enum is
+/// Wraps the RPCs and their replies. The enum is
 /// [`#[non_exhaustive]`](https://doc.rust-lang.org/reference/attributes/type_system.html#the-non_exhaustive-attribute):
-/// `InstallSnapshot` joins it in `v0.5`, so a `match` over a `Message` must
-/// include a wildcard arm.
+/// future versions may add variants, so a `match` over a `Message` must include
+/// a wildcard arm.
 ///
 /// # Examples
 ///
@@ -178,6 +233,7 @@ pub struct AppendEntriesReply {
 /// ```
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "framing", derive(pack_io::Serialize, pack_io::Deserialize))]
 pub enum Message {
     /// A candidate is asking for a vote.
     RequestVote(RequestVote),
@@ -187,6 +243,10 @@ pub enum Message {
     AppendEntries(AppendEntries),
     /// A follower is answering an append.
     AppendEntriesReply(AppendEntriesReply),
+    /// A leader is shipping a snapshot to a far-behind follower.
+    InstallSnapshot(InstallSnapshot),
+    /// A follower is acknowledging an installed snapshot.
+    InstallSnapshotReply(InstallSnapshotReply),
 }
 
 impl Message {
@@ -219,6 +279,8 @@ impl Message {
             Self::RequestVoteReply(m) => m.term,
             Self::AppendEntries(m) => m.term,
             Self::AppendEntriesReply(m) => m.term,
+            Self::InstallSnapshot(m) => m.term,
+            Self::InstallSnapshotReply(m) => m.term,
         }
     }
 }

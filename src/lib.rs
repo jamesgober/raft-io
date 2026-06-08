@@ -14,12 +14,13 @@
 //!
 //! ## Status
 //!
-//! This is `v0.4`: the deterministic core, leader election with term and vote
-//! safety, the full multi-node log-replication pipeline, and **durable
-//! persistence with crash recovery** — a `WalLog` (under the `persistence`
-//! feature) whose entries and hard state survive a restart, verified by
-//! crash-recovery property tests. Snapshots and log compaction land in `v0.5`.
-//! See `docs/API.md` for the full surface.
+//! This is `v0.5`: election, the full replication pipeline, durable persistence
+//! with crash recovery (`persistence` feature), and now **snapshots with log
+//! compaction** — a policy hint drives the application to snapshot, the log
+//! compacts behind it, and a follower too far behind to replicate is caught up
+//! with an `InstallSnapshot`. The `framing` feature adds `pack-io` wire framing
+//! for messages. Membership changes land in `v0.6`. See `docs/API.md` for the
+//! full surface.
 //!
 //! ## The three tiers
 //!
@@ -68,6 +69,9 @@
 
 mod config;
 mod error;
+#[cfg(feature = "framing")]
+#[cfg_attr(docsrs, doc(cfg(feature = "framing")))]
+pub mod framing;
 mod log;
 mod message;
 mod node;
@@ -81,11 +85,12 @@ pub use crate::config::RaftConfig;
 pub use crate::error::{Error, Result};
 pub use crate::log::{MemoryLog, RaftLog};
 pub use crate::message::{
-    AppendEntries, AppendEntriesReply, Message, RequestVote, RequestVoteReply,
+    AppendEntries, AppendEntriesReply, InstallSnapshot, InstallSnapshotReply, Message, RequestVote,
+    RequestVoteReply,
 };
 pub use crate::node::{Action, Event, RaftNode};
 pub use crate::transport::{MemoryTransport, RaftTransport};
-pub use crate::types::{HardState, Index, LogEntry, NodeId, Role, Term};
+pub use crate::types::{HardState, Index, LogEntry, NodeId, Role, Snapshot, Term};
 #[cfg(feature = "persistence")]
 #[cfg_attr(docsrs, doc(cfg(feature = "persistence")))]
 pub use crate::wal_log::WalLog;

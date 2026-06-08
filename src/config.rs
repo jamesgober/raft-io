@@ -27,6 +27,9 @@ const DEFAULT_HEARTBEAT: u32 = 3;
 /// size and per-RPC work so a far-behind follower is caught up in steady chunks
 /// rather than one unbounded payload.
 const DEFAULT_MAX_BATCH: usize = 64;
+/// Default snapshot threshold: `0` disables the policy hint, so snapshots are
+/// opt-in. A node never asks the application to snapshot unless this is set.
+const DEFAULT_SNAPSHOT_THRESHOLD: usize = 0;
 
 /// Configuration for a single [`RaftNode`](crate::RaftNode).
 ///
@@ -54,6 +57,7 @@ pub struct RaftConfig {
     pub(crate) election_timeout_max: u32,
     pub(crate) heartbeat_interval: u32,
     pub(crate) max_batch: usize,
+    pub(crate) snapshot_threshold: usize,
     pub(crate) seed: u64,
 }
 
@@ -84,6 +88,7 @@ impl RaftConfig {
             election_timeout_max: DEFAULT_ELECTION_MAX,
             heartbeat_interval: DEFAULT_HEARTBEAT,
             max_batch: DEFAULT_MAX_BATCH,
+            snapshot_threshold: DEFAULT_SNAPSHOT_THRESHOLD,
             seed: id,
         }
     }
@@ -176,6 +181,30 @@ impl RaftConfig {
         self
     }
 
+    /// Sets the snapshot threshold: how many applied entries may accumulate
+    /// beyond the last snapshot before the node asks the application to take a
+    /// new one.
+    ///
+    /// When the gap between the last applied index and the snapshot index reaches
+    /// `threshold`, the node emits an [`Action::Snapshot`](crate::Action::Snapshot)
+    /// hint; the application snapshots its state machine and feeds the bytes back
+    /// via [`Event::Snapshot`](crate::Event::Snapshot), and the log is compacted.
+    /// `0` (the default) disables the hint entirely, so snapshots are opt-in.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use raft_io::RaftConfig;
+    ///
+    /// let cfg = RaftConfig::new(1, [2, 3]).with_snapshot_threshold(1024);
+    /// assert_eq!(cfg.snapshot_threshold(), 1024);
+    /// ```
+    #[must_use]
+    pub fn with_snapshot_threshold(mut self, threshold: usize) -> Self {
+        self.snapshot_threshold = threshold;
+        self
+    }
+
     /// Sets the seed for the node's election-timeout RNG.
     ///
     /// Determinism is the point of the core, so the jitter source is seeded
@@ -230,6 +259,13 @@ impl RaftConfig {
     #[must_use]
     pub fn max_batch(&self) -> usize {
         self.max_batch
+    }
+
+    /// Returns the snapshot threshold (`0` if snapshots are disabled).
+    #[inline]
+    #[must_use]
+    pub fn snapshot_threshold(&self) -> usize {
+        self.snapshot_threshold
     }
 
     /// Returns the election-timeout RNG seed.

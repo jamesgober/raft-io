@@ -14,8 +14,9 @@
 //! write-ahead log, which frames and checksums each record. An in-memory index
 //! (a [`MemoryLog`]) mirrors the current state for fast reads. On
 //! [`open`](WalLog::open) the records are replayed in order to rebuild that index
-//! exactly. Truncated entries remain physically in the WAL until log compaction
-//! (snapshots, `v0.5`); replay reconstructs the correct logical state regardless.
+//! exactly. Installing a snapshot writes a snapshot record and then physically
+//! drops every earlier record from the WAL (re-persisting the current hard state
+//! first), so the file stays bounded as the log is compacted.
 //!
 //! [`RaftLog`]: crate::RaftLog
 
@@ -23,7 +24,7 @@ use wal_db::Wal;
 
 use crate::error::{Error, Result};
 use crate::log::{MemoryLog, RaftLog};
-use crate::types::{HardState, Index, LogEntry, Term};
+use crate::types::{HardState, Index, LogEntry, Snapshot, Term};
 
 /// Record tag for an appended [`LogEntry`].
 const TAG_ENTRY: u8 = 1;
@@ -31,6 +32,8 @@ const TAG_ENTRY: u8 = 1;
 const TAG_HARD_STATE: u8 = 2;
 /// Record tag for a truncation to a given index.
 const TAG_TRUNCATE: u8 = 3;
+/// Record tag for an installed [`Snapshot`].
+const TAG_SNAPSHOT: u8 = 4;
 
 /// A durable [`RaftLog`] whose entries and hard state survive a process restart.
 ///
@@ -83,6 +86,7 @@ impl WalLog {
                 Decoded::Entry(entry) => index.append(&[entry])?,
                 Decoded::HardState(hs) => index.set_hard_state(hs)?,
                 Decoded::Truncate(from) => index.truncate(from)?,
+                Decoded::Snapshot(snapshot) => index.apply_snapshot(&snapshot)?,
             }
         }
         Ok(Self { wal, index })
@@ -154,6 +158,39 @@ impl RaftLog for WalLog {
             .sync()
             .map_err(|e| Error::storage("sync durable log", e))
     }
+
+    #[inline]
+    fn snapshot_index(&self) -> Index {
+        self.index.snapshot_index()
+    }
+
+    fn snapshot(&self) -> Option<Snapshot> {
+        self.index.snapshot()
+    }
+
+    fn apply_snapshot(&mut self, snapshot: &Snapshot) -> Result<()> {
+        if snapshot.index <= self.index.snapshot_index() {
+            return Ok(()); // stale; nothing to persist
+        }
+        // Compact the in-memory index first.
+        self.index.apply_snapshot(snapshot)?;
+        // Persist the snapshot record, then re-write the current hard state so
+        // the latest term/vote sits *after* the snapshot in the log.
+        let lsn = self
+            .wal
+            .append(&encode_snapshot(snapshot))
+            .map_err(|e| Error::storage("persist snapshot", e))?;
+        self.write(
+            "persist hard state",
+            &encode_hard_state(&self.index.hard_state()),
+        )?;
+        // Physically drop every record before the snapshot. This is an
+        // optimisation: if it fails, the WAL is merely larger — replay still
+        // re-applies the snapshot record and reconstructs the same state — so the
+        // outcome is deliberately ignored rather than turned into a fatal error.
+        let _ = self.wal.truncate_before(lsn);
+        Ok(())
+    }
 }
 
 // ---- record codec --------------------------------------------------------
@@ -163,6 +200,17 @@ enum Decoded {
     Entry(LogEntry),
     HardState(HardState),
     Truncate(Index),
+    Snapshot(Snapshot),
+}
+
+fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 8 + 8 + 8 + snapshot.data.len());
+    buf.push(TAG_SNAPSHOT);
+    buf.extend_from_slice(&snapshot.index.to_le_bytes());
+    buf.extend_from_slice(&snapshot.term.to_le_bytes());
+    buf.extend_from_slice(&(snapshot.data.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&snapshot.data);
+    buf
 }
 
 fn encode_entry(entry: &LogEntry) -> Vec<u8> {
@@ -245,6 +293,23 @@ fn decode(data: &[u8]) -> Result<Decoded> {
         TAG_TRUNCATE => {
             let from = read_u64(data, rest_at)?;
             Ok(Decoded::Truncate(from))
+        }
+        TAG_SNAPSHOT => {
+            let index = read_u64(data, rest_at)?;
+            let term = read_u64(data, rest_at + 8)?;
+            let len = read_u64(data, rest_at + 16)? as usize;
+            let start = rest_at + 24;
+            let end = start
+                .checked_add(len)
+                .filter(|&e| e == data.len())
+                .ok_or_else(|| {
+                    Error::storage("decode durable log record", "snapshot length mismatch")
+                })?;
+            Ok(Decoded::Snapshot(Snapshot::new(
+                index,
+                term,
+                data[start..end].to_vec(),
+            )))
         }
         other => Err(Error::storage(
             "decode durable log record",
@@ -391,6 +456,40 @@ mod tests {
                 voted_for: Some(2)
             }
         );
+    }
+
+    #[test]
+    fn test_snapshot_compaction_survives_recovery() {
+        let (_dir, path) = temp_path();
+        {
+            let mut log = WalLog::open(&path).unwrap();
+            log.append(&[entry(1, 1, b"a"), entry(1, 2, b"b"), entry(2, 3, b"c")])
+                .unwrap();
+            log.apply_snapshot(&Snapshot::new(2, 1, b"state@2".to_vec()))
+                .unwrap();
+            log.append(&[entry(2, 4, b"d")]).unwrap();
+            log.sync().unwrap();
+        }
+        let recovered = WalLog::open(&path).unwrap();
+        // The snapshot boundary, the surviving tail, and the snapshot bytes all
+        // came back; compacted entries did not.
+        assert_eq!(recovered.snapshot_index(), 2);
+        assert_eq!(recovered.last_index(), 4);
+        assert_eq!(recovered.entry(1), None);
+        assert_eq!(recovered.entry(2), None);
+        assert_eq!(recovered.term_at(2), Some(1));
+        assert_eq!(recovered.entry(3).unwrap().command, b"c");
+        assert_eq!(recovered.entry(4).unwrap().command, b"d");
+        assert_eq!(recovered.snapshot().unwrap().data, b"state@2");
+    }
+
+    #[test]
+    fn test_snapshot_codec_round_trips() {
+        let snap = Snapshot::new(9, 4, b"payload".to_vec());
+        match decode(&encode_snapshot(&snap)).unwrap() {
+            Decoded::Snapshot(got) => assert_eq!(got, snap),
+            _ => panic!("wrong record"),
+        }
     }
 
     #[test]
