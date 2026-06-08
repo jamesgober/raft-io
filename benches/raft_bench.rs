@@ -60,6 +60,7 @@ fn bench_step(c: &mut Criterion) {
                             candidate: 2,
                             last_log_index: 0,
                             last_log_term: 0,
+                            force: false,
                         },
                     ))))
                     .expect("vote");

@@ -16,9 +16,9 @@
 
 > Complete reference for every public item in `raft-io`, with examples.
 >
-> **Status: pre-1.0 (`v0.5`).** This document tracks the API surface as it lands
-> across the 0.x series. The wire protocol and trait seams are frozen at `1.0`.
-> Sections marked _(planned: vX.Y)_ describe a surface a later phase introduces.
+> **Status: pre-1.0 (`v0.6`, feature complete).** This document tracks the API
+> surface as it lands across the 0.x series. The wire protocol and trait seams are
+> frozen at `1.0`. Sections marked _(planned: vX.Y)_ describe a later surface.
 
 ## Table of Contents
 
@@ -27,7 +27,7 @@
 - [Quick Start](#quick-start)
 - [The three tiers](#the-three-tiers)
 - [Public API](#public-api)
-  - [Value types](#value-types) — [`NodeId`](#nodeid--term--index), [`Term`](#nodeid--term--index), [`Index`](#nodeid--term--index), [`Role`](#role), [`LogEntry`](#logentry), [`HardState`](#hardstate), [`Snapshot`](#snapshot)
+  - [Value types](#value-types) — [`NodeId`](#nodeid--term--index), [`Term`](#nodeid--term--index), [`Index`](#nodeid--term--index), [`Role`](#role), [`EntryKind`](#entrykind), [`LogEntry`](#logentry), [`HardState`](#hardstate), [`Snapshot`](#snapshot)
   - [`RaftConfig`](#raftconfig)
   - [`RaftNode`](#raftnode)
   - [`Event`](#event)
@@ -52,15 +52,15 @@ storage are injected through the [`RaftLog`](#raftlog) and
 [`RaftTransport`](#rafttransport) seams. That separation is what makes the core
 provable — an entire run is reproducible from a seed and a sequence of events.
 
-At `v0.5` the protocol is feature-complete bar membership changes (`v0.6`): leader
-election with full term and vote safety, the complete multi-node
-log-replication pipeline (batched [`AppendEntries`](#appendentries), per-follower
-progress with optimistic pipelining, conflict-hint backtracking, commit on a
-quorum), durable persistence and crash recovery ([`WalLog`](#wallog), `persistence`
-feature), and **snapshots with log compaction** — a policy hint
-([`Action::Snapshot`](#action)) drives the application to snapshot, the log
-compacts behind it, and a follower too far behind to replicate is caught up with
-an [`InstallSnapshot`](#installsnapshot). The `framing` feature adds
+At `v0.6` the protocol is **feature complete**: leader election with full term and
+vote safety, the complete multi-node log-replication pipeline (batched
+[`AppendEntries`](#appendentries), per-follower progress with optimistic
+pipelining, conflict-hint backtracking, commit on a quorum), durable persistence
+and crash recovery ([`WalLog`](#wallog), `persistence` feature), snapshots with
+log compaction ([`Action::Snapshot`](#action) → [`InstallSnapshot`](#installsnapshot)),
+and **membership changes** — add or remove a voter one server at a time
+([`Event::AddServer`](#event) / [`Event::RemoveServer`](#event)) and transfer
+leadership ([`Event::TransferLeadership`](#event)). The `framing` feature adds
 [`pack-io`](#framing) wire encoding for messages.
 
 ---
@@ -69,11 +69,11 @@ an [`InstallSnapshot`](#installsnapshot). The `framing` feature adds
 
 ```toml
 [dependencies]
-raft-io = "0.5"
+raft-io = "0.6"
 
 # Optional features:
-raft-io = { version = "0.5", features = ["persistence"] } # durable wal-db-backed `WalLog`
-raft-io = { version = "0.5", features = ["framing"] }     # pack-io wire framing for messages
+raft-io = { version = "0.6", features = ["persistence"] } # durable wal-db-backed `WalLog`
+raft-io = { version = "0.6", features = ["framing"] }     # pack-io wire framing for messages
 ```
 
 MSRV: Rust 1.85 (edition 2024).
@@ -104,6 +104,7 @@ cargo run --example in_memory_cluster   # a 3-node cluster electing a leader
 cargo run --example replicated_log      # propose + replicate; all nodes agree
 cargo run --example partition_recovery  # minority stalls, majority commits, heal
 cargo run --example snapshot_catchup    # leader compacts; lagging node catches up via snapshot
+cargo run --example membership          # add a node, remove a node, transfer leadership
 cargo run --example persistent_node --features persistence  # log survives a restart
 ```
 
@@ -175,34 +176,50 @@ let node = RaftNode::new(RaftConfig::single(1));
 assert_eq!(node.role(), Role::Follower);
 ```
 
+#### `EntryKind`
+
+```rust
+pub enum EntryKind { Normal, Config }
+```
+
+What a [`LogEntry`](#logentry) carries. A `Normal` entry is an application command;
+a `Config` entry carries a cluster configuration (the voting membership) and
+drives a membership change — the protocol interprets its bytes and the application
+never applies them.
+
 #### `LogEntry`
 
 ```rust
 pub struct LogEntry {
     pub term: Term,
     pub index: Index,
+    pub kind: EntryKind,
     pub command: Vec<u8>,
 }
 ```
 
-A single command in the replicated log. `command` is opaque bytes — the protocol
-orders and replicates entries but never interprets them; the application's state
-machine decodes them on apply. `term` and `index` together identify an entry
-uniquely.
+A single entry in the replicated log. For a `Normal` entry, `command` is opaque
+bytes the protocol orders and replicates but never interprets; for a `Config`
+entry the bytes encode the voting membership. `term` and `index` together identify
+an entry uniquely.
 
-**Constructor**
+**Constructors & methods**
+
+| Item | Signature | Description |
+|---|---|---|
+| `new` | `fn new(term, index, command: Vec<u8>) -> LogEntry` | A `Normal` command entry. |
+| `config` | `fn config(term, index, members: &[NodeId]) -> LogEntry` | A `Config` entry carrying `members`. |
+| `members` | `fn members(&self) -> Option<Vec<NodeId>>` | The membership of a `Config` entry, or `None` for a `Normal` one. |
 
 ```rust
-pub fn new(term: Term, index: Index, command: Vec<u8>) -> LogEntry
-```
-
-```rust
-use raft_io::LogEntry;
+use raft_io::{EntryKind, LogEntry};
 
 let entry = LogEntry::new(2, 7, b"put k v".to_vec());
-assert_eq!(entry.term, 2);
-assert_eq!(entry.index, 7);
-assert_eq!(entry.command, b"put k v");
+assert_eq!(entry.kind, EntryKind::Normal);
+assert_eq!(entry.members(), None);
+
+let cfg = LogEntry::config(3, 9, &[1, 2, 3]);
+assert_eq!(cfg.members(), Some(vec![1, 2, 3]));
 ```
 
 #### `HardState`
@@ -233,21 +250,26 @@ assert_eq!(HardState::default().voted_for, None);
 pub struct Snapshot {
     pub index: Index,
     pub term: Term,
+    pub config: Vec<NodeId>,
     pub data: Vec<u8>,
 }
 ```
 
 A point-in-time capture of the application's state machine plus the log position
-it covers. `index` / `term` are the last entry the snapshot includes — the
-log's replacement boundary once earlier entries are compacted away — and `data`
-is the opaque serialized state the application produces and restores. Build one
-with `Snapshot::new(index, term, data)`.
+it covers. `index` / `term` are the last entry the snapshot includes — the log's
+replacement boundary once earlier entries are compacted away — `config` is the
+voting membership in effect at `index` (so a node catching up via snapshot, its
+configuration entries compacted, still knows who is in the cluster), and `data` is
+the opaque serialized state the application produces and restores. Build one with
+`Snapshot::new(index, term, data)` (empty config) or `Snapshot::with_config(index,
+term, config, data)`. The node fills the configuration in when it takes a snapshot.
 
 ```rust
 use raft_io::Snapshot;
 
-let snap = Snapshot::new(10, 3, b"serialized state".to_vec());
+let snap = Snapshot::with_config(10, 3, vec![1, 2, 3], b"state".to_vec());
 assert_eq!((snap.index, snap.term), (10, 3));
+assert_eq!(snap.config, vec![1, 2, 3]);
 ```
 
 ---
@@ -334,6 +356,7 @@ to name it.
 | `leader` | `Option<NodeId>` | The leader the node currently recognises. |
 | `commit_index` | `Index` | Highest log index known committed. |
 | `last_applied` | `Index` | Highest log index applied. |
+| `members` | `&[NodeId]` | The current voting membership of the cluster. |
 | `log` | `&L` | Shared reference to the underlying log. |
 
 #### `step`
@@ -421,6 +444,9 @@ pub enum Event {
     Message(Message),
     Propose(Vec<u8>),
     Snapshot { index: Index, data: Vec<u8> },
+    AddServer(NodeId),
+    RemoveServer(NodeId),
+    TransferLeadership(NodeId),
 }
 ```
 
@@ -434,6 +460,15 @@ The input to [`step`](#step). A node only changes state in response to an event:
   hint: the application has serialized its state through `index` into `data`. The
   node compacts the log up to `index`. A snapshot for an uncommitted or stale
   index is ignored.
+- **`AddServer(NodeId)`** / **`RemoveServer(NodeId)`** — add or remove a voting
+  server (leader only; [`Error::NotLeader`](#error) elsewhere). One change at a
+  time: a request while a previous one is uncommitted returns
+  [`Error::ConfigInProgress`](#error). The change takes effect immediately on the
+  leader, before it commits. Removing the leader makes it step down once the
+  change commits.
+- **`TransferLeadership(NodeId)`** — ask the leader to hand off to a voter `target`:
+  it catches the target up, then signals it to campaign at once. A no-op on a
+  non-leader or for a non-voting target.
 
 ```rust
 use raft_io::{Event, Message, RequestVote};
@@ -456,6 +491,7 @@ pub enum Action {
     Apply { index: Index, term: Term, command: Vec<u8> },
     Snapshot { index: Index, term: Term },
     RestoreSnapshot { index: Index, term: Term, data: Vec<u8> },
+    MembershipChanged { members: Vec<NodeId> },
 }
 ```
 
@@ -465,13 +501,17 @@ What [`step`](#step) returns for the caller to carry out. The node decides
 - **`Send { to, message }`** — deliver `message` to node `to` via the transport.
 - **`Apply { index, term, command }`** — apply a committed command to the state
   machine. Applies are emitted in strictly increasing index order, each index
-  once, so they can be applied blindly in sequence.
+  once, so they can be applied blindly in sequence. (Configuration entries are
+  not applied, so applied indices may skip them.)
 - **`Snapshot { index, term }`** — take a snapshot of the state machine through
   `index` and return it via [`Event::Snapshot`](#event). Emitted when the log
   grows past [`with_snapshot_threshold`](#with_snapshot_threshold).
 - **`RestoreSnapshot { index, term, data }`** — reset the state machine to an
   installed snapshot (on a follower that received a leader's snapshot). Subsequent
   `Apply` actions resume from `index + 1`.
+- **`MembershipChanged { members }`** — the voting membership changed. Update the
+  transport so it can reach the new members. Emitted on append of the change,
+  before it commits.
 
 `#[non_exhaustive]`: a `match` must include a wildcard arm.
 
@@ -514,10 +554,14 @@ pub enum Message {
     AppendEntriesReply(AppendEntriesReply),
     InstallSnapshot(InstallSnapshot),
     InstallSnapshotReply(InstallSnapshotReply),
+    TimeoutNow(TimeoutNow),
 }
 ```
 
 Wraps the RPCs and their replies. `#[non_exhaustive]` — match with a wildcard arm.
+**`TimeoutNow { term, leader }`** is a leader's signal during a leadership
+transfer, telling the target to campaign immediately rather than wait out its
+election timeout.
 
 **Method** — `term(&self) -> Term` returns the term carried by any variant,
 which the protocol checks first on every inbound message.
@@ -540,12 +584,17 @@ pub struct RequestVote {
     pub candidate: NodeId,
     pub last_log_index: Index,
     pub last_log_term: Term,
+    pub force: bool,
 }
 ```
 
 A candidate's request for a vote. A recipient grants it only if it has not voted
 in this term and the candidate's log is at least as up to date as its own — the
 election restriction that keeps a node missing committed entries off the throne.
+`force` marks an authorised election during a [leadership transfer](#event); a
+recipient honours it even within the leader-stickiness window (a node otherwise
+ignores vote requests while a leader it recognises is still active, so a removed
+or partitioned server cannot disrupt the cluster).
 
 #### `RequestVoteReply`
 
@@ -816,6 +865,7 @@ pub enum Error {
     NotLeader { leader: Option<NodeId> },
     Storage { context: &'static str, detail: String },
     Encoding { context: &'static str, detail: String },
+    ConfigInProgress,
 }
 ```
 
@@ -829,6 +879,7 @@ severity (`is_retryable` / `is_fatal`) metadata, and is an ordinary
 | `NotLeader { leader }` | A proposal reached a non-leader. `leader` is the best-known leader for the caller to redirect to (`None` during an election). | Retryable, not fatal. |
 | `Storage { context, detail }` | A [`RaftLog`](#raftlog) backend operation failed. `context` names the operation; `detail` is the backend's message. | Fatal, not retryable. |
 | `Encoding { context, detail }` | A message failed to [encode or decode](#framing) (the `framing` feature). | Not fatal — drop the malformed message. |
+| `ConfigInProgress` | A membership change was requested while a previous one is still uncommitted. | Retryable once the in-flight change completes. |
 
 <a id="error-helpers"></a>**Helpers** — `Error::storage(context, source)` and
 `Error::encoding(context, source)` build the respective error from any `Display`

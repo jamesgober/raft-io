@@ -14,13 +14,12 @@
 //!
 //! ## Status
 //!
-//! This is `v0.5`: election, the full replication pipeline, durable persistence
-//! with crash recovery (`persistence` feature), and now **snapshots with log
-//! compaction** — a policy hint drives the application to snapshot, the log
-//! compacts behind it, and a follower too far behind to replicate is caught up
-//! with an `InstallSnapshot`. The `framing` feature adds `pack-io` wire framing
-//! for messages. Membership changes land in `v0.6`. See `docs/API.md` for the
-//! full surface.
+//! This is `v0.6`: **feature complete.** Election, the full replication pipeline,
+//! durable persistence with crash recovery (`persistence` feature), snapshots
+//! with log compaction, `pack-io` wire framing (`framing` feature), and now
+//! **membership changes** — add or remove a voter one server at a time, and
+//! transfer leadership — round out the protocol. Hardening and the API/protocol
+//! freeze follow in `v0.7`. See `docs/API.md` for the full surface.
 //!
 //! ## The three tiers
 //!
@@ -86,11 +85,11 @@ pub use crate::error::{Error, Result};
 pub use crate::log::{MemoryLog, RaftLog};
 pub use crate::message::{
     AppendEntries, AppendEntriesReply, InstallSnapshot, InstallSnapshotReply, Message, RequestVote,
-    RequestVoteReply,
+    RequestVoteReply, TimeoutNow,
 };
 pub use crate::node::{Action, Event, RaftNode};
 pub use crate::transport::{MemoryTransport, RaftTransport};
-pub use crate::types::{HardState, Index, LogEntry, NodeId, Role, Snapshot, Term};
+pub use crate::types::{EntryKind, HardState, Index, LogEntry, NodeId, Role, Snapshot, Term};
 #[cfg(feature = "persistence")]
 #[cfg_attr(docsrs, doc(cfg(feature = "persistence")))]
 pub use crate::wal_log::WalLog;

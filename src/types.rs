@@ -56,13 +56,44 @@ pub enum Role {
     Leader,
 }
 
-/// A single command in the replicated log.
+/// What a [`LogEntry`] carries.
 ///
-/// The [`command`](LogEntry::command) is opaque bytes: the protocol replicates
-/// and orders entries but never interprets them. The application's state
-/// machine decodes the bytes when the entry is applied. Each entry records the
-/// [`term`](LogEntry::term) in which the leader created it and its
-/// [`index`](LogEntry::index) in the log, which together identify it uniquely.
+/// Most entries are [`Normal`](EntryKind::Normal) application commands. A
+/// [`Config`](EntryKind::Config) entry instead carries a cluster configuration —
+/// the voting membership — and drives a membership change; its
+/// [`command`](LogEntry::command) bytes encode the new member set rather than an
+/// application command, so the protocol interprets them and the application does
+/// not apply them.
+///
+/// # Examples
+///
+/// ```
+/// use raft_io::{EntryKind, LogEntry};
+///
+/// assert_eq!(LogEntry::new(1, 1, vec![]).kind, EntryKind::Normal);
+/// assert_eq!(LogEntry::config(1, 2, &[1, 2, 3]).kind, EntryKind::Config);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "framing", derive(pack_io::Serialize, pack_io::Deserialize))]
+pub enum EntryKind {
+    /// An ordinary application command, applied to the state machine.
+    #[default]
+    Normal,
+    /// A cluster-configuration change. The command bytes encode the new voting
+    /// membership; the protocol adopts it and never applies it to the state
+    /// machine.
+    Config,
+}
+
+/// A single entry in the replicated log.
+///
+/// The [`command`](LogEntry::command) is opaque bytes: for a
+/// [`Normal`](EntryKind::Normal) entry the protocol replicates and orders it but
+/// never interprets it, and the application's state machine decodes it on apply;
+/// for a [`Config`](EntryKind::Config) entry the bytes encode the new voting
+/// membership. Each entry records the [`term`](LogEntry::term) in which the
+/// leader created it and its [`index`](LogEntry::index) in the log, which
+/// together identify it uniquely.
 ///
 /// # Examples
 ///
@@ -81,12 +112,16 @@ pub struct LogEntry {
     pub term: Term,
     /// 1-based position of this entry in the log.
     pub index: Index,
-    /// Opaque application command. The protocol never inspects these bytes.
+    /// Whether this is a normal command or a configuration change.
+    pub kind: EntryKind,
+    /// Opaque bytes: an application command, or an encoded member set for a
+    /// [`Config`](EntryKind::Config) entry.
     pub command: Vec<u8>,
 }
 
 impl LogEntry {
-    /// Creates a log entry at `index` in `term` carrying `command`.
+    /// Creates a [`Normal`](EntryKind::Normal) log entry at `index` in `term`
+    /// carrying `command`.
     ///
     /// # Examples
     ///
@@ -102,9 +137,75 @@ impl LogEntry {
         Self {
             term,
             index,
+            kind: EntryKind::Normal,
             command,
         }
     }
+
+    /// Creates a [`Config`](EntryKind::Config) log entry carrying the voting
+    /// membership `members`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use raft_io::LogEntry;
+    ///
+    /// let e = LogEntry::config(3, 9, &[1, 2, 3]);
+    /// assert_eq!(e.members(), Some(vec![1, 2, 3]));
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn config(term: Term, index: Index, members: &[NodeId]) -> Self {
+        Self {
+            term,
+            index,
+            kind: EntryKind::Config,
+            command: encode_members(members),
+        }
+    }
+
+    /// Returns the voting membership a [`Config`](EntryKind::Config) entry
+    /// carries, or `None` for a [`Normal`](EntryKind::Normal) entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use raft_io::LogEntry;
+    ///
+    /// assert_eq!(LogEntry::new(1, 1, vec![]).members(), None);
+    /// assert_eq!(LogEntry::config(1, 2, &[7, 8]).members(), Some(vec![7, 8]));
+    /// ```
+    #[must_use]
+    pub fn members(&self) -> Option<Vec<NodeId>> {
+        match self.kind {
+            EntryKind::Normal => None,
+            EntryKind::Config => Some(decode_members(&self.command)),
+        }
+    }
+}
+
+/// Encodes a voting membership as little-endian `u64`s.
+#[must_use]
+pub(crate) fn encode_members(members: &[NodeId]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(members.len() * 8);
+    for &id in members {
+        buf.extend_from_slice(&id.to_le_bytes());
+    }
+    buf
+}
+
+/// Decodes a voting membership written by [`encode_members`]. A trailing partial
+/// chunk (only possible from corruption) is ignored.
+#[must_use]
+pub(crate) fn decode_members(bytes: &[u8]) -> Vec<NodeId> {
+    bytes
+        .chunks_exact(8)
+        .map(|c| {
+            let mut id = [0u8; 8];
+            id.copy_from_slice(c);
+            NodeId::from_le_bytes(id)
+        })
+        .collect()
 }
 
 /// The state Raft must persist before responding to any RPC.
@@ -158,13 +259,24 @@ pub struct Snapshot {
     pub index: Index,
     /// Term of the last log entry the snapshot includes.
     pub term: Term,
+    /// Voting membership in effect at [`index`](Snapshot::index).
+    ///
+    /// Carried so a node that catches up from this snapshot — its configuration
+    /// log entries having been compacted away — still knows who is in the
+    /// cluster. The node fills this in when it takes a snapshot; an application
+    /// constructing a snapshot directly with [`new`](Snapshot::new) leaves it
+    /// empty.
+    pub config: Vec<NodeId>,
     /// Opaque serialized state machine state. The protocol never inspects it.
     pub data: Vec<u8>,
 }
 
 impl Snapshot {
     /// Creates a snapshot covering the log through `index` (created in `term`),
-    /// carrying serialized state `data`.
+    /// carrying serialized state `data` and an empty configuration.
+    ///
+    /// The node fills the configuration in when it takes a snapshot; use this
+    /// constructor for snapshots that do not track membership.
     ///
     /// # Examples
     ///
@@ -173,11 +285,39 @@ impl Snapshot {
     ///
     /// let snap = Snapshot::new(5, 2, vec![1, 2, 3]);
     /// assert_eq!(snap.data, vec![1, 2, 3]);
+    /// assert!(snap.config.is_empty());
     /// ```
     #[inline]
     #[must_use]
     pub fn new(index: Index, term: Term, data: Vec<u8>) -> Self {
-        Self { index, term, data }
+        Self {
+            index,
+            term,
+            config: Vec::new(),
+            data,
+        }
+    }
+
+    /// Creates a snapshot that also records the voting membership `config` in
+    /// effect at `index`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use raft_io::Snapshot;
+    ///
+    /// let snap = Snapshot::with_config(5, 2, vec![1, 2, 3], vec![0xAB]);
+    /// assert_eq!(snap.config, vec![1, 2, 3]);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn with_config(index: Index, term: Term, config: Vec<NodeId>, data: Vec<u8>) -> Self {
+        Self {
+            index,
+            term,
+            config,
+            data,
+        }
     }
 }
 
@@ -211,5 +351,45 @@ mod tests {
         let copy = r;
         assert_eq!(r, copy);
         assert_ne!(Role::Follower, Role::Candidate);
+    }
+
+    #[test]
+    fn test_normal_entry_has_no_members() {
+        let e = LogEntry::new(1, 1, b"cmd".to_vec());
+        assert_eq!(e.kind, EntryKind::Normal);
+        assert_eq!(e.members(), None);
+    }
+
+    #[test]
+    fn test_config_entry_round_trips_members() {
+        let e = LogEntry::config(3, 9, &[1, 2, 3, 99]);
+        assert_eq!(e.kind, EntryKind::Config);
+        assert_eq!(e.members(), Some(vec![1, 2, 3, 99]));
+    }
+
+    #[test]
+    fn test_empty_config_entry() {
+        assert_eq!(LogEntry::config(1, 1, &[]).members(), Some(vec![]));
+    }
+
+    #[test]
+    fn test_member_codec_round_trips() {
+        for members in [vec![], vec![0], vec![1, 2, 3], vec![u64::MAX, 0, 7]] {
+            assert_eq!(decode_members(&encode_members(&members)), members);
+        }
+    }
+
+    #[test]
+    fn test_decode_members_ignores_trailing_partial_chunk() {
+        let mut bytes = encode_members(&[5, 6]);
+        bytes.push(0xFF); // a stray byte from corruption
+        assert_eq!(decode_members(&bytes), vec![5, 6]);
+    }
+
+    #[test]
+    fn test_snapshot_with_config_carries_membership() {
+        let snap = Snapshot::with_config(5, 2, vec![1, 2, 3], vec![0xAB]);
+        assert_eq!(snap.config, vec![1, 2, 3]);
+        assert!(Snapshot::new(5, 2, vec![]).config.is_empty());
     }
 }

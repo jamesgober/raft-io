@@ -29,7 +29,7 @@ use crate::message::Message;
 /// use raft_io::{framing, Message, RequestVote};
 ///
 /// let msg = Message::RequestVote(RequestVote {
-///     term: 4, candidate: 2, last_log_index: 9, last_log_term: 3,
+///     term: 4, candidate: 2, last_log_index: 9, last_log_term: 3, force: false,
 /// });
 /// let bytes = framing::encode(&msg).unwrap();
 /// assert_eq!(framing::decode(&bytes).unwrap(), msg);
@@ -70,7 +70,7 @@ mod tests {
     use super::*;
     use crate::message::{
         AppendEntries, AppendEntriesReply, InstallSnapshot, InstallSnapshotReply, RequestVote,
-        RequestVoteReply,
+        RequestVoteReply, TimeoutNow,
     };
     use crate::types::{LogEntry, Snapshot};
 
@@ -86,6 +86,7 @@ mod tests {
             candidate: 2,
             last_log_index: 9,
             last_log_term: 3,
+            force: false,
         }));
         round_trip(Message::RequestVoteReply(RequestVoteReply {
             term: 4,
@@ -97,9 +98,10 @@ mod tests {
             leader: 1,
             prev_log_index: 2,
             prev_log_term: 1,
+            // Mix a normal command and a configuration entry to cover EntryKind.
             entries: vec![
                 LogEntry::new(5, 3, b"cmd".to_vec()),
-                LogEntry::new(5, 4, vec![]),
+                LogEntry::config(5, 4, &[1, 2, 3]),
             ],
             leader_commit: 2,
         }));
@@ -121,6 +123,12 @@ mod tests {
             from: 2,
             last_index: 10,
         }));
+        round_trip(Message::InstallSnapshot(InstallSnapshot {
+            term: 6,
+            leader: 1,
+            snapshot: Snapshot::with_config(10, 3, vec![1, 2, 3], b"state".to_vec()),
+        }));
+        round_trip(Message::TimeoutNow(TimeoutNow { term: 7, leader: 1 }));
     }
 
     #[test]

@@ -32,7 +32,7 @@ use crate::types::NodeId;
 ///
 /// let mut tx = MemoryTransport::new();
 /// tx.send(2, Message::RequestVote(RequestVote {
-///     term: 1, candidate: 1, last_log_index: 0, last_log_term: 0,
+///     term: 1, candidate: 1, last_log_index: 0, last_log_term: 0, force: false,
 /// })).unwrap();
 /// assert_eq!(tx.take().len(), 1);
 /// ```

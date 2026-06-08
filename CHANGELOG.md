@@ -19,6 +19,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.6.0] - 2026-06-08
+
+Membership changes and leadership transfer. The protocol is now feature complete;
+hardening and the API/protocol freeze follow in v0.7.
+
+### Added
+
+- Single-server membership changes: `Event::AddServer` / `Event::RemoveServer`
+  append a configuration entry that the node adopts immediately (Raft applies a
+  config change on append, not on commit). One change is processed at a time —
+  a request made while a previous change is uncommitted returns the new
+  `Error::ConfigInProgress`. A leader removed from the configuration steps down
+  once the change commits.
+- Dynamic quorum: the voting membership (`RaftNode::members`) drives elections
+  and commitment and is recovered from the log or a snapshot on restart.
+- `Action::MembershipChanged` notifies the application of the new membership so
+  it can update its transport's peer set.
+- Leadership transfer: `Event::TransferLeadership` brings the target up to date
+  and sends it the new `TimeoutNow` message so it campaigns immediately.
+- Leader stickiness (Raft §4.2.3): a node ignores a `RequestVote` while a leader
+  it recognises is still active, so a removed or partitioned server cannot
+  disrupt the cluster with ever-higher terms. A forced election during a
+  leadership transfer (new `RequestVote.force` flag) bypasses it.
+- `EntryKind` (`Normal` / `Config`) on `LogEntry`, with `LogEntry::config` and
+  `LogEntry::members`. Snapshots carry the configuration (`Snapshot.config`,
+  `Snapshot::with_config`) so a node catching up via snapshot knows the
+  membership. `WalLog` and the `framing` codec persist and frame both.
+- Membership test suite (`tests/membership.rs`): add and remove a server under
+  load, leadership transfer, and an adversarial churn proptest. Plus unit tests
+  for configuration recovery, one-change-at-a-time, and stickiness.
+- `membership` example (add a node, remove a node, transfer leadership).
+
+### Changed
+
+- `LogEntry` gains a `kind` field, `RequestVote` a `force` field, and `Snapshot`
+  a `config` field (all pre-1.0 shape changes). `Message` gains a `TimeoutNow`
+  variant; `Event` and `Action` gain the membership/transfer variants.
+
+### Fixed
+
+- A follower that had already caught up past an `InstallSnapshot`'s index (via
+  normal replication, or holding a newer snapshot) no longer installs the older
+  snapshot and resets its state backwards; it acknowledges the index it already
+  covers instead.
+
+---
+
 ## [0.5.0] - 2026-06-08
 
 Snapshots and log compaction, plus typed wire framing. A node can now bound its
@@ -188,7 +235,8 @@ Initial scaffold and repository bootstrap. No raft-io logic yet &mdash; this rel
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jamesgober/raft-io/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/raft-io/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/raft-io/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/raft-io/compare/v0.2.0...v0.3.0

@@ -28,7 +28,9 @@ use crate::types::{Index, LogEntry, NodeId, Snapshot, Term};
 /// ```
 /// use raft_io::RequestVote;
 ///
-/// let rv = RequestVote { term: 4, candidate: 2, last_log_index: 9, last_log_term: 3 };
+/// let rv = RequestVote {
+///     term: 4, candidate: 2, last_log_index: 9, last_log_term: 3, force: false,
+/// };
 /// assert_eq!(rv.candidate, 2);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +44,11 @@ pub struct RequestVote {
     pub last_log_index: Index,
     /// Term of the candidate's last log entry.
     pub last_log_term: Term,
+    /// A forced election, requested by the current leader as part of a
+    /// [leadership transfer](crate::Event::TransferLeadership). A recipient
+    /// honours it even within the leader-stickiness window, so the hand-off is
+    /// not blocked by its own loyalty to the departing leader.
+    pub force: bool,
 }
 
 /// A peer's response to a [`RequestVote`].
@@ -208,6 +215,30 @@ pub struct InstallSnapshotReply {
     pub last_index: Index,
 }
 
+/// A leader's signal telling `target` to start an election immediately.
+///
+/// Sent during a [leadership transfer](crate::Event::TransferLeadership): once the
+/// target is fully caught up, the leader sends this so the target campaigns at
+/// once instead of waiting out its election timeout, taking over with minimal
+/// disruption.
+///
+/// # Examples
+///
+/// ```
+/// use raft_io::TimeoutNow;
+///
+/// let rpc = TimeoutNow { term: 5, leader: 1 };
+/// assert_eq!(rpc.leader, 1);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "framing", derive(pack_io::Serialize, pack_io::Deserialize))]
+pub struct TimeoutNow {
+    /// The leader's term.
+    pub term: Term,
+    /// The leader handing off leadership.
+    pub leader: NodeId,
+}
+
 /// Any message a node can send or receive.
 ///
 /// Wraps the RPCs and their replies. The enum is
@@ -225,6 +256,7 @@ pub struct InstallSnapshotReply {
 ///     candidate: 1,
 ///     last_log_index: 0,
 ///     last_log_term: 0,
+///     force: false,
 /// });
 /// match msg {
 ///     Message::RequestVote(rv) => assert_eq!(rv.term, 1),
@@ -247,6 +279,8 @@ pub enum Message {
     InstallSnapshot(InstallSnapshot),
     /// A follower is acknowledging an installed snapshot.
     InstallSnapshotReply(InstallSnapshotReply),
+    /// A leader is handing off leadership, telling the target to campaign now.
+    TimeoutNow(TimeoutNow),
 }
 
 impl Message {
@@ -281,6 +315,7 @@ impl Message {
             Self::AppendEntriesReply(m) => m.term,
             Self::InstallSnapshot(m) => m.term,
             Self::InstallSnapshotReply(m) => m.term,
+            Self::TimeoutNow(m) => m.term,
         }
     }
 }
@@ -297,6 +332,7 @@ mod tests {
                 candidate: 1,
                 last_log_index: 0,
                 last_log_term: 0,
+                force: false,
             })
             .term(),
             1

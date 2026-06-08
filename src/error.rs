@@ -88,6 +88,14 @@ pub enum Error {
         /// The underlying codec error, rendered as text.
         detail: String,
     },
+
+    /// A membership change was requested while a previous one is still in flight.
+    ///
+    /// Raft changes the configuration one server at a time, and the leader must
+    /// not begin a new change until the previous configuration entry has
+    /// committed. Retry once the in-flight change completes. This is a routine,
+    /// retryable condition.
+    ConfigInProgress,
 }
 
 impl fmt::Display for Error {
@@ -105,6 +113,9 @@ impl fmt::Display for Error {
             Self::Encoding { context, detail } => {
                 write!(f, "message framing error while {context}: {detail}")
             }
+            Self::ConfigInProgress => {
+                write!(f, "a configuration change is already in progress")
+            }
         }
     }
 }
@@ -117,6 +128,7 @@ impl ForgeError for Error {
             Self::NotLeader { .. } => "NotLeader",
             Self::Storage { .. } => "Storage",
             Self::Encoding { .. } => "Encoding",
+            Self::ConfigInProgress => "ConfigInProgress",
         }
     }
 
@@ -125,13 +137,15 @@ impl ForgeError for Error {
             Self::NotLeader { .. } => "Not the leader",
             Self::Storage { .. } => "Log storage failure",
             Self::Encoding { .. } => "Message framing failure",
+            Self::ConfigInProgress => "Configuration change in progress",
         }
     }
 
-    /// A `NotLeader` rejection is retryable against the indicated leader; a
+    /// A `NotLeader` rejection is retryable against the indicated leader and a
+    /// `ConfigInProgress` rejection is retryable once the change completes; a
     /// storage failure on the durability path is not.
     fn is_retryable(&self) -> bool {
-        matches!(self, Self::NotLeader { .. })
+        matches!(self, Self::NotLeader { .. } | Self::ConfigInProgress)
     }
 
     /// A storage failure means the node can no longer guarantee durability and

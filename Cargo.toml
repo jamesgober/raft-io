@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "raft-io"
-version = "0.5.0"
+version = "0.6.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"

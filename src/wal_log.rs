@@ -24,7 +24,7 @@ use wal_db::Wal;
 
 use crate::error::{Error, Result};
 use crate::log::{MemoryLog, RaftLog};
-use crate::types::{HardState, Index, LogEntry, Snapshot, Term};
+use crate::types::{EntryKind, HardState, Index, LogEntry, NodeId, Snapshot, Term};
 
 /// Record tag for an appended [`LogEntry`].
 const TAG_ENTRY: u8 = 1;
@@ -204,20 +204,46 @@ enum Decoded {
 }
 
 fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(1 + 8 + 8 + 8 + snapshot.data.len());
+    let mut buf =
+        Vec::with_capacity(1 + 8 + 8 + 8 + snapshot.config.len() * 8 + 8 + snapshot.data.len());
     buf.push(TAG_SNAPSHOT);
     buf.extend_from_slice(&snapshot.index.to_le_bytes());
     buf.extend_from_slice(&snapshot.term.to_le_bytes());
+    buf.extend_from_slice(&(snapshot.config.len() as u64).to_le_bytes());
+    for &id in &snapshot.config {
+        buf.extend_from_slice(&id.to_le_bytes());
+    }
     buf.extend_from_slice(&(snapshot.data.len() as u64).to_le_bytes());
     buf.extend_from_slice(&snapshot.data);
     buf
 }
 
+/// On-disk byte for an [`EntryKind`].
+fn kind_byte(kind: EntryKind) -> u8 {
+    match kind {
+        EntryKind::Normal => 0,
+        EntryKind::Config => 1,
+    }
+}
+
+/// Reads an [`EntryKind`] from its on-disk byte.
+fn kind_from_byte(byte: u8) -> Result<EntryKind> {
+    match byte {
+        0 => Ok(EntryKind::Normal),
+        1 => Ok(EntryKind::Config),
+        other => Err(Error::storage(
+            "decode durable log record",
+            format!("unknown entry kind {other}"),
+        )),
+    }
+}
+
 fn encode_entry(entry: &LogEntry) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(1 + 8 + 8 + 8 + entry.command.len());
+    let mut buf = Vec::with_capacity(1 + 8 + 8 + 1 + 8 + entry.command.len());
     buf.push(TAG_ENTRY);
     buf.extend_from_slice(&entry.term.to_le_bytes());
     buf.extend_from_slice(&entry.index.to_le_bytes());
+    buf.push(kind_byte(entry.kind));
     buf.extend_from_slice(&(entry.command.len() as u64).to_le_bytes());
     buf.extend_from_slice(&entry.command);
     buf
@@ -267,19 +293,24 @@ fn decode(data: &[u8]) -> Result<Decoded> {
         TAG_ENTRY => {
             let term = read_u64(data, rest_at)?;
             let index = read_u64(data, rest_at + 8)?;
-            let len = read_u64(data, rest_at + 16)? as usize;
-            let start = rest_at + 24;
+            let kind =
+                kind_from_byte(*data.get(rest_at + 16).ok_or_else(|| {
+                    Error::storage("decode durable log record", "entry truncated")
+                })?)?;
+            let len = read_u64(data, rest_at + 17)? as usize;
+            let start = rest_at + 25;
             let end = start
                 .checked_add(len)
                 .filter(|&e| e == data.len())
                 .ok_or_else(|| {
                     Error::storage("decode durable log record", "entry length mismatch")
                 })?;
-            Ok(Decoded::Entry(LogEntry::new(
+            Ok(Decoded::Entry(LogEntry {
                 term,
                 index,
-                data[start..end].to_vec(),
-            )))
+                kind,
+                command: data[start..end].to_vec(),
+            }))
         }
         TAG_HARD_STATE => {
             let term = read_u64(data, rest_at)?;
@@ -297,17 +328,25 @@ fn decode(data: &[u8]) -> Result<Decoded> {
         TAG_SNAPSHOT => {
             let index = read_u64(data, rest_at)?;
             let term = read_u64(data, rest_at + 8)?;
-            let len = read_u64(data, rest_at + 16)? as usize;
-            let start = rest_at + 24;
+            let config_count = read_u64(data, rest_at + 16)? as usize;
+            let mut config = Vec::with_capacity(config_count);
+            let mut off = rest_at + 24;
+            for _ in 0..config_count {
+                config.push(read_u64(data, off)? as NodeId);
+                off += 8;
+            }
+            let len = read_u64(data, off)? as usize;
+            let start = off + 8;
             let end = start
                 .checked_add(len)
                 .filter(|&e| e == data.len())
                 .ok_or_else(|| {
                     Error::storage("decode durable log record", "snapshot length mismatch")
                 })?;
-            Ok(Decoded::Snapshot(Snapshot::new(
+            Ok(Decoded::Snapshot(Snapshot::with_config(
                 index,
                 term,
+                config,
                 data[start..end].to_vec(),
             )))
         }
@@ -485,11 +524,30 @@ mod tests {
 
     #[test]
     fn test_snapshot_codec_round_trips() {
-        let snap = Snapshot::new(9, 4, b"payload".to_vec());
+        let snap = Snapshot::with_config(9, 4, vec![1, 2, 3], b"payload".to_vec());
         match decode(&encode_snapshot(&snap)).unwrap() {
             Decoded::Snapshot(got) => assert_eq!(got, snap),
             _ => panic!("wrong record"),
         }
+    }
+
+    #[test]
+    fn test_config_entry_and_snapshot_membership_survive_recovery() {
+        let (_dir, path) = temp_path();
+        {
+            let mut log = WalLog::open(&path).unwrap();
+            log.apply_snapshot(&Snapshot::with_config(2, 1, vec![1, 2, 3], b"s".to_vec()))
+                .unwrap();
+            log.append(&[LogEntry::config(2, 3, &[1, 2, 3, 4])])
+                .unwrap();
+            log.sync().unwrap();
+        }
+        let recovered = WalLog::open(&path).unwrap();
+        assert_eq!(recovered.snapshot().unwrap().config, vec![1, 2, 3]);
+        assert_eq!(
+            recovered.entry(3).unwrap().members(),
+            Some(vec![1, 2, 3, 4])
+        );
     }
 
     #[test]

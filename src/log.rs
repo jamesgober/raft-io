@@ -14,7 +14,7 @@
 //! the crate's own — no associated error type for callers to name.
 
 use crate::error::{Error, Result};
-use crate::types::{HardState, Index, LogEntry, Snapshot, Term};
+use crate::types::{HardState, Index, LogEntry, NodeId, Snapshot, Term};
 
 /// Storage for a node's persistent state: its log entries and its
 /// [`HardState`].
@@ -217,6 +217,8 @@ pub struct MemoryLog {
     base_term: Term,
     /// Snapshot bytes, present once a snapshot has been installed.
     snapshot: Option<Vec<u8>>,
+    /// Voting membership recorded by the current snapshot.
+    snapshot_config: Vec<NodeId>,
     hard: HardState,
 }
 
@@ -382,9 +384,14 @@ impl RaftLog for MemoryLog {
     }
 
     fn snapshot(&self) -> Option<Snapshot> {
-        self.snapshot
-            .as_ref()
-            .map(|data| Snapshot::new(self.base_index, self.base_term, data.clone()))
+        self.snapshot.as_ref().map(|data| {
+            Snapshot::with_config(
+                self.base_index,
+                self.base_term,
+                self.snapshot_config.clone(),
+                data.clone(),
+            )
+        })
     }
 
     fn apply_snapshot(&mut self, snapshot: &Snapshot) -> Result<()> {
@@ -402,6 +409,7 @@ impl RaftLog for MemoryLog {
         self.base_index = snapshot.index;
         self.base_term = snapshot.term;
         self.snapshot = Some(snapshot.data.clone());
+        self.snapshot_config = snapshot.config.clone();
         Ok(())
     }
 }
