@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "raft-io"
-version = "0.3.0"
+version = "0.4.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -61,9 +61,13 @@ path = "src/lib.rs"
 
 # FEATURE FLAGS
 # #################################
-# Additive only. `persistence` (wal-db) arrives in v0.4 and `framing`
-# (pack-io) in v0.5, each wired when the code that uses it lands; an
-# optional dependency with no gated code path would violate REPS.
+# Additive only. `framing` (pack-io) arrives in v0.5, wired when the code that
+# uses it lands; an optional dependency with no gated code path would violate
+# REPS.
+[features]
+# Durable Raft log via `wal-db`: adds `WalLog`, a `RaftLog` whose entries and
+# hard state survive a restart. The in-memory path is unaffected when off.
+persistence = ["dep:wal-db"]
 
 
 # DEPENDENCIES
@@ -73,6 +77,9 @@ path = "src/lib.rs"
 # stable `kind` / `caption` / severity metadata consumers rely on; its
 # `ForgeError` supertrait is `std::error::Error`, so the crate is std-based.
 error-forge = { version = "1", default-features = false }
+# Durable write-ahead log backing `WalLog`, behind the `persistence` feature.
+# Byte-record API only (no `pack-io` feature): raft-io frames its own records.
+wal-db = { version = "1.0", optional = true, default-features = false }
 
 
 # DEV DEPENDENCIES
@@ -84,6 +91,16 @@ tempfile  = "3"
 
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
+
+
+# EXAMPLES
+# #################################
+# The persistent-log example needs the `persistence` feature, so it is only built
+# when that feature is enabled (e.g. `cargo run --example persistent_node
+# --features persistence`).
+[[example]]
+name              = "persistent_node"
+required-features = ["persistence"]
 
 
 # BENCHMARKS

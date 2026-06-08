@@ -45,7 +45,8 @@
 - **Log replication** &mdash; batched append-entries with per-follower progress, optimistic pipelining, conflict-hint backtracking, and commit on a quorum _(live in v0.3)_
 - **Deterministic core** &mdash; the state machine is pure and step-driven, so the whole protocol is testable without time or I/O _(live)_
 - **Pluggable transport** &mdash; `RaftTransport` trait; in-memory for tests, real net for production _(live)_
-- **Pluggable log store** &mdash; `RaftLog` trait; `wal-db`-backed under the `persistence` feature _(trait live; durable backend in v0.4)_
+- **Pluggable log store** &mdash; `RaftLog` trait; `wal-db`-backed `WalLog` under the `persistence` feature _(live in v0.4)_
+- **Crash recovery** &mdash; term, vote, and log persisted before each RPC; a restarted node recovers and rejoins without violating safety _(live in v0.4)_
 - **Snapshotting** &mdash; install-snapshot for log compaction and fast follower catch-up _(v0.5)_
 - **Membership changes** &mdash; single-server add/remove via joint-consensus-safe reconfiguration _(v0.6)_
 
@@ -56,7 +57,10 @@
 
 ```toml
 [dependencies]
-raft-io = "0.3"
+raft-io = "0.4"
+
+# For a durable, crash-recoverable log (wal-db-backed `WalLog`):
+raft-io = { version = "0.4", features = ["persistence"] }
 ```
 
 <br>
@@ -103,19 +107,21 @@ cargo run --example single_node         # elect + propose + apply, one node
 cargo run --example in_memory_cluster   # a 3-node cluster electing a leader
 cargo run --example replicated_log      # propose + replicate; all nodes agree
 cargo run --example partition_recovery  # minority stalls, majority commits, heal
+cargo run --example persistent_node --features persistence  # log survives a restart
 ```
 
 <br>
 
 ## Status
 
-This is `v0.3.0`: a correct multi-node cluster. On top of v0.2's election layer,
-the full log-replication pipeline is implemented — batched `AppendEntries`,
-per-follower progress with optimistic pipelining, conflict-hint backtracking, and
-commit on a quorum (current-term rule). An adversarial property-test suite drives
-3- and 5-node clusters through reordered, dropped, duplicated, and partitioned
-message schedules and asserts that committed entries never diverge. Durable
-persistence (`wal-db`) lands in `v0.4` and snapshots in `v0.5`, per the
+This is `v0.4.0`: a correct, durable multi-node cluster. On top of v0.3's
+replication pipeline, the `persistence` feature adds `WalLog` — a
+`wal-db`-backed log whose entries and hard state (term, vote) are persisted
+before each RPC and recovered on restart. An adversarial property-test suite
+drives 3- and 5-node clusters through reordered, dropped, duplicated, and
+partitioned schedules — now with node crashes interleaved — and asserts that
+committed entries never diverge and a restarted node rejoins without violating
+safety. Snapshots and log compaction land in `v0.5`, per the
 <a href="./.dev/ROADMAP.md"><code>ROADMAP</code></a> (development copy). The full
 public surface is documented in <a href="./docs/API.md"><code>docs/API.md</code></a>.
 

@@ -16,7 +16,7 @@
 
 > Complete reference for every public item in `raft-io`, with examples.
 >
-> **Status: pre-1.0 (`v0.3`).** This document tracks the API surface as it lands
+> **Status: pre-1.0 (`v0.4`).** This document tracks the API surface as it lands
 > across the 0.x series. The wire protocol and trait seams are frozen at `1.0`.
 > Sections marked _(planned: vX.Y)_ describe a surface a later phase introduces.
 
@@ -33,7 +33,7 @@
   - [`Event`](#event)
   - [`Action`](#action)
   - [Messages](#messages) — [`Message`](#message), [`RequestVote`](#requestvote), [`RequestVoteReply`](#requestvotereply), [`AppendEntries`](#appendentries), [`AppendEntriesReply`](#appendentriesreply)
-  - [`RaftLog`](#raftlog) & [`MemoryLog`](#memorylog)
+  - [`RaftLog`](#raftlog), [`MemoryLog`](#memorylog) & [`WalLog`](#wallog)
   - [`RaftTransport`](#rafttransport) & [`MemoryTransport`](#memorytransport)
   - [`Error`](#error) & [`Result`](#result)
 - [Feature flags](#feature-flags)
@@ -52,11 +52,13 @@ storage are injected through the [`RaftLog`](#raftlog) and
 [`RaftTransport`](#rafttransport) seams. That separation is what makes the core
 provable — an entire run is reproducible from a seed and a sequence of events.
 
-At `v0.3` the implemented surface is leader election with full term and vote
-safety plus the complete multi-node log-replication pipeline: batched
+At `v0.4` the implemented surface is leader election with full term and vote
+safety, the complete multi-node log-replication pipeline (batched
 [`AppendEntries`](#appendentries), per-follower progress with optimistic
-pipelining, conflict-hint backtracking, and commit on a quorum. Durable
-persistence is `v0.4` and snapshots are `v0.5`.
+pipelining, conflict-hint backtracking, commit on a quorum), and **durable
+persistence**: [`WalLog`](#wallog), a `wal-db`-backed [`RaftLog`](#raftlog) under
+the `persistence` feature whose entries and hard state survive a restart.
+Snapshots and log compaction are `v0.5`.
 
 ---
 
@@ -64,7 +66,10 @@ persistence is `v0.4` and snapshots are `v0.5`.
 
 ```toml
 [dependencies]
-raft-io = "0.3"
+raft-io = "0.4"
+
+# Durable, crash-recoverable log (wal-db-backed `WalLog`):
+raft-io = { version = "0.4", features = ["persistence"] }
 ```
 
 MSRV: Rust 1.85 (edition 2024).
@@ -94,6 +99,7 @@ cargo run --example single_node         # elect + propose + apply, one node
 cargo run --example in_memory_cluster   # a 3-node cluster electing a leader
 cargo run --example replicated_log      # propose + replicate; all nodes agree
 cargo run --example partition_recovery  # minority stalls, majority commits, heal
+cargo run --example persistent_node --features persistence  # log survives a restart
 ```
 
 ---
@@ -640,6 +646,51 @@ let err = log.append(&[LogEntry::new(1, 2, vec![])]).unwrap_err(); // expected i
 assert!(matches!(err, Error::Storage { .. }));
 ```
 
+### `WalLog`
+
+_Requires the `persistence` feature._
+
+A durable [`RaftLog`](#raftlog) backed by `wal-db`, whose entries and hard state
+(term and vote) survive a process restart. This is what makes a node
+crash-recoverable: Raft's safety depends on `current_term`, `voted_for`, and the
+log being durable before the node acts on them.
+
+It is log-structured. Every mutation — an appended entry, a hard-state update, a
+truncation — is encoded as a record and appended to a `wal-db` write-ahead log
+(which frames and checksums each record); an in-memory index mirrors the current
+state for fast reads. [`open`](#wallog) replays the records to rebuild that index
+exactly. Reads are served from memory; writes become durable when
+[`sync`](#raftlog) returns `Ok` — and the node always `sync`s before it replies,
+honouring the "persist before you respond" rule.
+
+**Constructor**
+
+| Method | Signature | Description |
+|---|---|---|
+| `open` | `fn open(path: impl AsRef<Path>) -> Result<WalLog>` | Open (creating if absent) and recover the log at `path`. Returns [`Error::Storage`](#error) if the file cannot be opened or a record fails to decode. |
+
+Plus the full [`RaftLog`](#raftlog) trait.
+
+```rust,no_run
+use raft_io::{LogEntry, RaftConfig, RaftLog, RaftNode, WalLog};
+
+// Open a durable log and hand it to a node.
+let log = WalLog::open("node-1.wal")?;
+let mut node = RaftNode::with_log(RaftConfig::single(1), log);
+# let _ = &mut node;
+
+// After a restart, reopening the same path recovers the entries and the
+// persisted term/vote.
+let recovered = WalLog::open("node-1.wal")?;
+assert_eq!(recovered.last_index(), node.log().last_index());
+# Ok::<(), raft_io::Error>(())
+```
+
+Truncated entries remain physically in the WAL until log compaction (snapshots,
+`v0.5`); replay still reconstructs the correct logical state. The byte-record
+API of `wal-db` is used directly — `raft-io` frames its own records and does not
+enable `wal-db`'s `pack-io` feature.
+
 ---
 
 ### `RaftTransport`
@@ -730,13 +781,12 @@ signatures read `Result<T>`.
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| _(none yet)_ | — | The `v0.3` core has no feature flags. |
+| `persistence` | no | Adds [`WalLog`](#wallog), a durable `wal-db`-backed [`RaftLog`](#raftlog). The in-memory path is unaffected when off. |
 
-Two flags are reserved for later phases and are not yet present on the crate,
+One more flag is reserved for a later phase and is not yet present on the crate,
 because an optional dependency without a code path that uses it would be dead
-weight: **`persistence`** (durable Raft log via `wal-db`) lands in `v0.4`, and
-**`framing`** (typed RPC/message framing via `pack-io`) in `v0.5`. Both will be
-purely additive.
+weight: **`framing`** (typed RPC/message framing via `pack-io`) lands in `v0.5`.
+It will be purely additive.
 
 ---
 

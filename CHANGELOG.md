@@ -19,6 +19,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.4.0] - 2026-06-08
+
+Durable persistence and crash recovery. A node can now back its log with a
+`wal-db`-backed store whose entries and hard state survive a restart, so a
+crashed node recovers and rejoins without violating safety.
+
+### Added
+
+- `WalLog` (feature `persistence`): a durable `RaftLog` backed by `wal-db`. It is
+  log-structured — each appended entry, hard-state update, and truncation is a
+  checksummed WAL record — with an in-memory index for reads, rebuilt exactly by
+  replaying the WAL on `WalLog::open`.
+- `persistence` feature flag, wiring the optional `wal-db` dependency
+  (byte-record API only; `raft-io` frames its own records).
+- Crash-recovery test suite (`tests/recovery.rs`, feature-gated): a property test
+  that interleaves node crashes into an adversarial schedule and asserts
+  committed entries never diverge, plus deterministic tests that a fully
+  replicated log survives a full-cluster restart and that hard state is durable.
+- A durability-contract unit test proving the node persists and `sync`s its vote
+  before replying, and makes no durable write on a no-op.
+- `persistent_node` example (run with `--features persistence`): a node whose log
+  survives being dropped and reopened.
+
+### Changed
+
+- CI now exercises both the default (in-memory) and `--all-features` (with
+  `persistence`) build, test, and clippy paths.
+
+---
+
 ## [0.3.0] - 2026-06-08
 
 Log replication and a correct multi-node cluster. On top of v0.2's election
@@ -117,7 +147,8 @@ Initial scaffold and repository bootstrap. No raft-io logic yet &mdash; this rel
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/raft-io/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/raft-io/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/raft-io/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/raft-io/releases/tag/v0.1.0

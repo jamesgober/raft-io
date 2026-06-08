@@ -14,12 +14,12 @@
 //!
 //! ## Status
 //!
-//! This is `v0.3`: the deterministic core, leader election with term and vote
-//! safety, and the full multi-node log-replication pipeline — batched
-//! `AppendEntries`, per-follower progress tracking with optimistic pipelining,
-//! conflict-hint backtracking, and commit on a quorum. Durable persistence
-//! (`wal-db`) lands in `v0.4` and snapshots in `v0.5`. See `docs/API.md` for the
-//! full surface.
+//! This is `v0.4`: the deterministic core, leader election with term and vote
+//! safety, the full multi-node log-replication pipeline, and **durable
+//! persistence with crash recovery** — a `WalLog` (under the `persistence`
+//! feature) whose entries and hard state survive a restart, verified by
+//! crash-recovery property tests. Snapshots and log compaction land in `v0.5`.
+//! See `docs/API.md` for the full surface.
 //!
 //! ## The three tiers
 //!
@@ -74,6 +74,8 @@ mod node;
 mod rng;
 mod transport;
 mod types;
+#[cfg(feature = "persistence")]
+mod wal_log;
 
 pub use crate::config::RaftConfig;
 pub use crate::error::{Error, Result};
@@ -84,3 +86,6 @@ pub use crate::message::{
 pub use crate::node::{Action, Event, RaftNode};
 pub use crate::transport::{MemoryTransport, RaftTransport};
 pub use crate::types::{HardState, Index, LogEntry, NodeId, Role, Term};
+#[cfg(feature = "persistence")]
+#[cfg_attr(docsrs, doc(cfg(feature = "persistence")))]
+pub use crate::wal_log::WalLog;

@@ -1370,4 +1370,98 @@ mod tests {
         let acts = node.step(Event::Tick).unwrap();
         collect_sends(acts)
     }
+
+    // ---- durability contract ----------------------------------------------
+
+    /// A [`RaftLog`] wrapper that counts [`sync`](RaftLog::sync) calls, to prove
+    /// the node makes state durable before it replies.
+    #[derive(Default)]
+    struct SyncCountLog {
+        inner: MemoryLog,
+        syncs: std::cell::Cell<u32>,
+    }
+
+    impl SyncCountLog {
+        fn syncs(&self) -> u32 {
+            self.syncs.get()
+        }
+    }
+
+    impl RaftLog for SyncCountLog {
+        fn last_index(&self) -> Index {
+            self.inner.last_index()
+        }
+        fn last_term(&self) -> Term {
+            self.inner.last_term()
+        }
+        fn term_at(&self, index: Index) -> Option<Term> {
+            self.inner.term_at(index)
+        }
+        fn entry(&self, index: Index) -> Option<LogEntry> {
+            self.inner.entry(index)
+        }
+        fn append(&mut self, entries: &[LogEntry]) -> Result<()> {
+            self.inner.append(entries)
+        }
+        fn truncate(&mut self, from: Index) -> Result<()> {
+            self.inner.truncate(from)
+        }
+        fn hard_state(&self) -> HardState {
+            self.inner.hard_state()
+        }
+        fn set_hard_state(&mut self, state: HardState) -> Result<()> {
+            self.inner.set_hard_state(state)
+        }
+        fn sync(&mut self) -> Result<()> {
+            self.syncs.set(self.syncs.get() + 1);
+            self.inner.sync()
+        }
+    }
+
+    #[test]
+    fn test_granting_a_vote_persists_and_syncs_before_replying() {
+        let mut node = RaftNode::with_log(RaftConfig::new(1, [2, 3]), SyncCountLog::default());
+        let actions = node
+            .step(Event::Message(Message::RequestVote(RequestVote {
+                term: 4,
+                candidate: 2,
+                last_log_index: 0,
+                last_log_term: 0,
+            })))
+            .unwrap();
+        // The grant was produced...
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Send { message: Message::RequestVoteReply(r), .. } if r.vote_granted
+        )));
+        // ...and the vote was durably synced as part of handling it.
+        assert!(
+            node.log().syncs() >= 1,
+            "vote must be synced before the reply"
+        );
+        assert_eq!(node.log().hard_state().voted_for, Some(2));
+    }
+
+    #[test]
+    fn test_rejected_vote_makes_no_durable_write() {
+        // Node already at term 5 having voted; a stale lower-term request changes
+        // nothing and must not force a sync.
+        let mut log = SyncCountLog::default();
+        log.set_hard_state(HardState {
+            term: 5,
+            voted_for: Some(9),
+        })
+        .unwrap();
+        let mut node = RaftNode::with_log(RaftConfig::new(1, [2, 3]), log);
+        let before = node.log().syncs();
+        let _ = node
+            .step(Event::Message(Message::RequestVote(RequestVote {
+                term: 3, // stale
+                candidate: 2,
+                last_log_index: 0,
+                last_log_term: 0,
+            })))
+            .unwrap();
+        assert_eq!(node.log().syncs(), before, "a no-op vote must not sync");
+    }
 }
