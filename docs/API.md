@@ -9,6 +9,8 @@
         <span>&nbsp;│&nbsp;</span>
         <span>API</span>
         <span>&nbsp;│&nbsp;</span>
+        <a href="./PROTOCOL.md" title="Protocol Specification"><b>PROTOCOL</b></a>
+        <span>&nbsp;│&nbsp;</span>
         <a href="../CHANGELOG.md" title="Changelog"><b>CHANGELOG</b></a>
     </sup>
 </div>
@@ -16,9 +18,10 @@
 
 > Complete reference for every public item in `raft-io`, with examples.
 >
-> **Status: pre-1.0 (`v0.6`, feature complete).** This document tracks the API
-> surface as it lands across the 0.x series. The wire protocol and trait seams are
-> frozen at `1.0`. Sections marked _(planned: vX.Y)_ describe a later surface.
+> **Status: pre-1.0 (`v0.7`, feature complete and frozen).** The public traits and
+> the wire and WAL formats are frozen as of v0.7 (see
+> [`PROTOCOL.md`](./PROTOCOL.md)); additions before `1.0` remain
+> backward-compatible. This document is the reference for every public item.
 
 ## Table of Contents
 
@@ -69,11 +72,11 @@ leadership ([`Event::TransferLeadership`](#event)). The `framing` feature adds
 
 ```toml
 [dependencies]
-raft-io = "0.6"
+raft-io = "0.7"
 
 # Optional features:
-raft-io = { version = "0.6", features = ["persistence"] } # durable wal-db-backed `WalLog`
-raft-io = { version = "0.6", features = ["framing"] }     # pack-io wire framing for messages
+raft-io = { version = "0.7", features = ["persistence"] } # durable wal-db-backed `WalLog`
+raft-io = { version = "0.7", features = ["framing"] }     # pack-io wire framing for messages
 ```
 
 MSRV: Rust 1.85 (edition 2024).

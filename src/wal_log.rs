@@ -382,6 +382,17 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        /// Fuzz the WAL record decoder: arbitrary bytes must yield `Ok` or `Err`,
+        /// never a panic, so a corrupt or truncated record cannot crash recovery.
+        #[test]
+        fn wal_decode_never_panics(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512)
+        ) {
+            let _ = decode(&bytes);
+        }
+    }
+
     #[test]
     fn test_hard_state_codec_round_trips() {
         for hs in [

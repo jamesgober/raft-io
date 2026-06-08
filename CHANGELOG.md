@@ -19,6 +19,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.7.0] - 2026-06-08
+
+Hardening and the API/protocol freeze. No new features — the public traits and the
+wire and WAL formats are frozen as of this release and will not break before 2.0.
+
+### Added
+
+- `tests/hardening.rs` — a jepsen-style harness that turns every fault mode on at
+  once (partitions, message loss, reorder, duplication, membership churn, and
+  snapshotting under a randomised schedule) and asserts all five Raft safety
+  properties continuously: Election Safety, Leader Append-Only, Log Matching,
+  Leader Completeness / State Machine Safety, and apply ordering. The two
+  properties the earlier suites did not cover explicitly — Leader Append-Only and
+  Log Matching — are now checked.
+- Decode-path fuzzing: `proptest` no-panic coverage for `framing::decode` and the
+  `WalLog` record decoder (cross-platform, in the default suite), plus a
+  `cargo-fuzz` target (`fuzz/`) for coverage-guided fuzzing on nightly.
+- `docs/PROTOCOL.md` — a normative specification of the protocol, the message set
+  and wire framing, the durable WAL record format, and the safety invariants.
+
+### Changed
+
+- **API and protocol freeze.** The public traits (`RaftLog`, `RaftTransport`),
+  the `Message` set and its `pack-io` framing, and the `WalLog` record format are
+  frozen; future additions remain backward-compatible via the `#[non_exhaustive]`
+  enums and tagged encodings. Cross-platform verification of the persistent path
+  runs on the Linux/macOS/Windows CI matrix.
+
+---
+
 ## [0.6.0] - 2026-06-08
 
 Membership changes and leadership transfer. The protocol is now feature complete;
@@ -235,7 +265,8 @@ Initial scaffold and repository bootstrap. No raft-io logic yet &mdash; this rel
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/raft-io/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/raft-io/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/raft-io/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/raft-io/compare/v0.3.0...v0.4.0

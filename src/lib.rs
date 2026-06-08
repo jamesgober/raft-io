@@ -14,12 +14,15 @@
 //!
 //! ## Status
 //!
-//! This is `v0.6`: **feature complete.** Election, the full replication pipeline,
-//! durable persistence with crash recovery (`persistence` feature), snapshots
-//! with log compaction, `pack-io` wire framing (`framing` feature), and now
-//! **membership changes** — add or remove a voter one server at a time, and
-//! transfer leadership — round out the protocol. Hardening and the API/protocol
-//! freeze follow in `v0.7`. See `docs/API.md` for the full surface.
+//! This is `v0.7`: **feature complete, hardened, and frozen.** The full protocol
+//! — election, replication, durable crash recovery (`persistence`), snapshots,
+//! membership changes, and leadership transfer — is in place and verified by a
+//! kitchen-sink adversarial test suite that asserts all five Raft safety
+//! properties under combined partitions, message loss/reorder/duplication,
+//! membership churn, and snapshotting. The public traits and the wire and WAL
+//! formats are frozen (see `docs/PROTOCOL.md`); the decode path is fuzzed.
+//! Alpha/beta hardening against real consumers follows in `v0.8`+. See
+//! `docs/API.md` for the full surface.
 //!
 //! ## The three tiers
 //!

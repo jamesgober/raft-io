@@ -136,4 +136,27 @@ mod tests {
         // A truncated / nonsensical byte string must not decode to a message.
         assert!(decode(&[0xFF, 0xFF, 0xFF]).is_err());
     }
+
+    proptest::proptest! {
+        /// Fuzz the decode path: arbitrary bytes must yield `Ok` or `Err`, never
+        /// a panic — untrusted input off the wire cannot crash a node.
+        #[test]
+        fn decode_never_panics_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512)
+        ) {
+            let _ = decode(&bytes);
+        }
+
+        /// Anything that decodes re-encodes to the identical bytes (a decoded
+        /// message is in canonical form).
+        #[test]
+        fn decoded_messages_re_encode_identically(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512)
+        ) {
+            if let Ok(message) = decode(&bytes) {
+                let re = encode(&message).unwrap();
+                proptest::prop_assert_eq!(decode(&re).unwrap(), message);
+            }
+        }
+    }
 }

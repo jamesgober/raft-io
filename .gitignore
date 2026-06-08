@@ -43,3 +43,9 @@ Homestead.json
 
 # Cargo lock (libraries don't commit lock)
 Cargo.lock
+
+# cargo-fuzz artifacts (the fuzz crate's build output, corpora, and crashes)
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/

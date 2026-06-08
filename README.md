@@ -58,11 +58,11 @@
 
 ```toml
 [dependencies]
-raft-io = "0.6"
+raft-io = "0.7"
 
 # Optional features:
-raft-io = { version = "0.6", features = ["persistence"] } # durable wal-db-backed `WalLog`
-raft-io = { version = "0.6", features = ["framing"] }     # pack-io wire framing for messages
+raft-io = { version = "0.7", features = ["persistence"] } # durable wal-db-backed `WalLog`
+raft-io = { version = "0.7", features = ["framing"] }     # pack-io wire framing for messages
 ```
 
 <br>
@@ -118,14 +118,16 @@ cargo run --example persistent_node --features persistence  # log survives a res
 
 ## Status
 
-This is `v0.6.0`: **feature complete.** On top of election, the replication
-pipeline, durable crash recovery, and snapshots, this release adds **membership
-changes** — add or remove a voter one server at a time (with safe sequencing and
-leader stickiness so a removed node cannot disrupt the cluster) and transfer
-leadership to a chosen peer. Adversarial property tests drive clusters through
-reordered, dropped, duplicated, and partitioned schedules — with crashes,
-snapshots, and membership churn interleaved — and assert that committed entries
-never diverge. Hardening and the API/protocol freeze follow in `v0.7`, per the
+This is `v0.7.0`: **feature complete, hardened, and frozen.** The full protocol —
+election, replication, durable crash recovery, snapshots, membership changes, and
+leadership transfer — is in place. A kitchen-sink adversarial test suite drives
+clusters through combined partitions, message loss/reorder/duplication, membership
+churn, and snapshotting, and asserts all five Raft safety properties (Election
+Safety, Leader Append-Only, Log Matching, Leader Completeness, State Machine
+Safety) continuously over sustained runs; the decode path is fuzzed. The public
+traits and the wire and WAL formats are now **frozen** — see the normative
+<a href="./docs/PROTOCOL.md"><code>docs/PROTOCOL.md</code></a>. Alpha/beta hardening
+against real consumers follows in `v0.8`+, per the
 <a href="./.dev/ROADMAP.md"><code>ROADMAP</code></a> (development copy). The full
 public surface is documented in <a href="./docs/API.md"><code>docs/API.md</code></a>.
 

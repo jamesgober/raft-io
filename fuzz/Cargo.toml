@@ -1,0 +1,32 @@
+# Fuzzing harness for raft-io's untrusted decode paths.
+#
+# This is a standalone `cargo-fuzz` crate, deliberately its own workspace so it
+# does not affect the library's build, lockfile, or dependency audit. It is not
+# part of the default CI (libFuzzer needs a nightly toolchain and is unavailable
+# on Windows); the same decode paths are fuzzed continuously and cross-platform
+# by the `proptest` no-panic tests in the library. See README.md to run it.
+[package]
+name    = "raft-io-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.raft-io]
+path     = ".."
+features = ["framing"]
+
+[[bin]]
+name    = "framing_decode"
+path    = "fuzz_targets/framing_decode.rs"
+test    = false
+doc     = false
+bench   = false
+
+# Standalone: keep this crate out of the parent's build graph.
+[workspace]
