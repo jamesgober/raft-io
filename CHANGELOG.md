@@ -19,6 +19,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.8.0] - 2026-06-08
+
+Alpha: integration against the library's first real consumer, and the liveness
+fix that consumer surfaced. All additions are MINOR-compatible — no existing
+signature, wire encoding, or WAL record changed.
+
+### Added
+
+- **Pre-vote elections (Raft thesis §9.6).** A node now runs a pre-vote round
+  before a real election: it asks peers whether they *would* grant a vote at the
+  next term without incrementing its own term, and campaigns for real only once a
+  quorum agrees. A partitioned node therefore never inflates its term, so on
+  rejoin it cannot force the sitting leader to step down. New `Message::PreVote`
+  and `Message::PreVoteReply` variants carry the probe; they are additive
+  `#[non_exhaustive]` enum variants and leave every existing message encoding
+  unchanged.
+- `prelude` module (`use raft_io::prelude::*;`) re-exporting the everyday surface
+  — `RaftNode`, `RaftConfig`, `Event`, `Action`, `Error`/`Result`, the log and
+  transport traits and their in-memory implementations.
+- `examples/kv_store.rs` — a replicated key-value store built on the core, end to
+  end: it elects a leader, replicates writes so every node converges, then adds a
+  node that catches up from a snapshot to the identical state.
+- `tests/kv_consumer.rs` — application-level convergence: a replicated key-value
+  store is driven through writes, partitions, and snapshotting, and after the
+  cluster heals every node's materialized map must equal a single-threaded model
+  of the committed command sequence — including a node rebuilt from a snapshot.
+
+### Fixed
+
+- A rejoining node that had been partitioned long enough to inflate its term
+  could briefly stall the cluster: its stale-term `AppendEntries` rejection forced
+  the leader to step down, churning leadership until an up-to-date node won an
+  election. Pre-vote removes the term inflation at its source, so convergence
+  under partition-heal is now prompt. Surfaced by the new key-value consumer
+  property test under heavy fault injection.
+
+---
+
 ## [0.7.0] - 2026-06-08
 
 Hardening and the API/protocol freeze. No new features — the public traits and the
@@ -273,7 +311,8 @@ Initial scaffold and repository bootstrap. No raft-io logic yet &mdash; this rel
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/raft-io/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/raft-io/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/raft-io/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/raft-io/compare/v0.4.0...v0.5.0

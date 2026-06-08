@@ -31,8 +31,8 @@ use crate::config::RaftConfig;
 use crate::error::{Error, Result};
 use crate::log::{MemoryLog, RaftLog};
 use crate::message::{
-    AppendEntries, AppendEntriesReply, InstallSnapshot, InstallSnapshotReply, Message, RequestVote,
-    RequestVoteReply, TimeoutNow,
+    AppendEntries, AppendEntriesReply, InstallSnapshot, InstallSnapshotReply, Message, PreVote,
+    PreVoteReply, RequestVote, RequestVoteReply, TimeoutNow,
 };
 use crate::rng::Rng;
 use crate::types::{HardState, Index, LogEntry, NodeId, Role, Snapshot, Term};
@@ -272,6 +272,12 @@ pub struct RaftNode<L: RaftLog = MemoryLog> {
     heartbeat_elapsed: u32,
     election_timeout: u32,
     votes: Vec<NodeId>,
+    /// Whether a pre-vote round is outstanding. While set, the node has not yet
+    /// incremented its term — it is only probing whether a real election could
+    /// be won (Raft §9.6). It remains a [`Follower`](Role::Follower) throughout.
+    pre_voting: bool,
+    /// Distinct peers that have granted the current pre-vote round.
+    pre_votes: Vec<NodeId>,
     /// Per-peer replication progress, aligned with `peers`. Non-empty only while
     /// this node is the leader.
     progress: Vec<Progress>,
@@ -375,6 +381,8 @@ impl<L: RaftLog> RaftNode<L> {
             heartbeat_elapsed: 0,
             election_timeout,
             votes: Vec::new(),
+            pre_voting: false,
+            pre_votes: Vec::new(),
             progress: Vec::new(),
             snapshot_hinted_at: base,
             transfer_target: None,
@@ -610,9 +618,11 @@ impl<L: RaftLog> RaftNode<L> {
             Role::Follower | Role::Candidate => {
                 self.election_elapsed += 1;
                 // Only a voting member campaigns; a node not in the configuration
-                // (for example, removed, or not yet caught up) follows quietly.
+                // (for example, removed, or not yet caught up) follows quietly. A
+                // timeout opens a pre-vote round rather than a real election, so a
+                // partitioned node cannot inflate its term (Raft §9.6).
                 if self.election_elapsed >= self.election_timeout && self.is_voter() {
-                    self.start_election(false, &mut actions)?;
+                    self.start_pre_vote(&mut actions)?;
                 }
             }
             Role::Leader => {
@@ -626,12 +636,58 @@ impl<L: RaftLog> RaftNode<L> {
         Ok(actions)
     }
 
+    /// Opens a pre-vote round (Raft §9.6): asks peers whether they *would* vote
+    /// for this node at the next term, without incrementing the term or casting a
+    /// vote. A real election begins only once a quorum of pre-votes is collected.
+    ///
+    /// This is the disruption guard. A node partitioned from the cluster never
+    /// gathers a pre-vote majority, so its term never climbs; when it rejoins it
+    /// does not force the sitting leader to step down. The node stays a
+    /// [`Follower`](Role::Follower) for the duration of the round — it has not
+    /// truly campaigned.
+    fn start_pre_vote(&mut self, actions: &mut Vec<Action>) -> Result<()> {
+        self.role = Role::Follower;
+        self.leader_id = None;
+        self.pre_voting = true;
+        self.pre_votes.clear();
+        self.pre_votes.push(self.id);
+        self.reset_election_timer();
+
+        // A single-node cluster (or any where one grant is a majority) needs no
+        // probe: campaign for real at once.
+        if self.pre_votes.len() >= self.quorum() {
+            return self.start_election(false, actions);
+        }
+
+        let last_log_index = self.log.last_index();
+        let last_log_term = self.log.last_term();
+        let term = self.current_term + 1; // the hypothetical term, not adopted
+        let id = self.id;
+        for &peer in &self.voters {
+            if peer == id {
+                continue;
+            }
+            actions.push(Action::Send {
+                to: peer,
+                message: Message::PreVote(PreVote {
+                    term,
+                    candidate: id,
+                    last_log_index,
+                    last_log_term,
+                }),
+            });
+        }
+        Ok(())
+    }
+
     fn start_election(&mut self, force: bool, actions: &mut Vec<Action>) -> Result<()> {
         self.role = Role::Candidate;
         self.current_term += 1;
         self.voted_for = Some(self.id);
         self.leader_id = None;
         self.transfer_target = None;
+        self.pre_voting = false;
+        self.pre_votes.clear();
         self.progress.clear();
         self.votes.clear();
         self.votes.push(self.id);
@@ -672,6 +728,8 @@ impl<L: RaftLog> RaftNode<L> {
         self.leader_id = Some(self.id);
         self.heartbeat_elapsed = 0;
         self.transfer_target = None;
+        self.pre_voting = false;
+        self.pre_votes.clear();
         // Initialise per-peer progress for the current configuration: each
         // follower is assumed caught up (next = last + 1) and probed to find
         // where it actually is.
@@ -842,6 +900,8 @@ impl<L: RaftLog> RaftNode<L> {
         self.role = Role::Follower;
         self.leader_id = None;
         self.transfer_target = None;
+        self.pre_voting = false;
+        self.pre_votes.clear();
         self.progress.clear();
         self.votes.clear();
     }
@@ -948,13 +1008,30 @@ impl<L: RaftLog> RaftNode<L> {
             return Ok(Vec::new());
         }
 
+        let mut actions = Vec::new();
+
+        // Pre-vote messages are hypothetical: they carry a term the sender has not
+        // adopted, and neither side changes any persistent state for them. Handle
+        // and return before the generic higher-term step-down below — a pre-vote
+        // must never inflate our term, which is the whole point of the mechanism.
+        let message = match message {
+            Message::PreVote(pv) => {
+                self.handle_pre_vote(pv, &mut actions);
+                return Ok(actions);
+            }
+            Message::PreVoteReply(reply) => {
+                self.handle_pre_vote_reply(reply, &mut actions)?;
+                return Ok(actions);
+            }
+            other => other,
+        };
+
         // Any other message from a later term forces a step-down and term
         // adoption, before the message is interpreted in its own right.
         if message.term() > self.current_term {
             self.become_follower(message.term(), None)?;
         }
 
-        let mut actions = Vec::new();
         match message {
             Message::RequestVote(rv) => self.handle_request_vote(rv, &mut actions)?,
             Message::RequestVoteReply(reply) => self.handle_vote_reply(reply, &mut actions),
@@ -965,6 +1042,8 @@ impl<L: RaftLog> RaftNode<L> {
                 self.handle_install_snapshot_reply(reply, &mut actions);
             }
             Message::TimeoutNow(rpc) => self.handle_timeout_now(rpc, &mut actions)?,
+            // Routed above, before the term step-down.
+            Message::PreVote(_) | Message::PreVoteReply(_) => {}
         }
         Ok(actions)
     }
@@ -978,6 +1057,8 @@ impl<L: RaftLog> RaftNode<L> {
         }
         self.leader_id = leader;
         self.transfer_target = None;
+        self.pre_voting = false;
+        self.pre_votes.clear();
         self.votes.clear();
         self.progress.clear();
         if hard_state_changed {
@@ -1033,6 +1114,54 @@ impl<L: RaftLog> RaftNode<L> {
         }
     }
 
+    /// Answers a peer's pre-vote probe. Grants only if we recognise no active
+    /// leader (the same stickiness that guards a real vote), the probe's
+    /// hypothetical term is not behind ours, and the candidate's log is at least
+    /// as up to date as ours. A pre-vote changes no persistent state: we neither
+    /// adopt its term nor record a vote, so a peer may grant several pre-votes in
+    /// the same term — only the real [`RequestVote`] consumes the single vote.
+    fn handle_pre_vote(&mut self, pv: PreVote, actions: &mut Vec<Action>) {
+        let have_active_leader =
+            self.leader_id.is_some() && self.election_elapsed < self.election_timeout_min;
+        let granted = pv.term >= self.current_term
+            && !have_active_leader
+            && self.candidate_log_up_to_date(pv.last_log_term, pv.last_log_index);
+        actions.push(Action::Send {
+            to: pv.candidate,
+            message: Message::PreVoteReply(PreVoteReply {
+                term: self.current_term,
+                vote_granted: granted,
+                from: self.id,
+            }),
+        });
+    }
+
+    /// Counts a pre-vote reply. A reply carrying a higher term means real activity
+    /// we are behind on, so we abandon the round and adopt that term. Otherwise a
+    /// grant adds to the tally, and once a quorum is reached we begin the real
+    /// election — only here does the term finally advance.
+    fn handle_pre_vote_reply(
+        &mut self,
+        reply: PreVoteReply,
+        actions: &mut Vec<Action>,
+    ) -> Result<()> {
+        if !self.pre_voting {
+            return Ok(());
+        }
+        if reply.term > self.current_term {
+            self.pre_voting = false;
+            self.pre_votes.clear();
+            return self.become_follower(reply.term, None);
+        }
+        if reply.vote_granted && !self.pre_votes.contains(&reply.from) {
+            self.pre_votes.push(reply.from);
+            if self.pre_votes.len() >= self.quorum() {
+                self.start_election(false, actions)?;
+            }
+        }
+        Ok(())
+    }
+
     fn handle_append_entries(
         &mut self,
         ae: AppendEntries,
@@ -1057,8 +1186,10 @@ impl<L: RaftLog> RaftNode<L> {
         }
 
         // A valid leader for our term: accept its authority and reset the timer.
+        // Recognising a leader ends any pre-vote round in progress.
         self.role = Role::Follower;
         self.leader_id = Some(ae.leader);
+        self.pre_voting = false;
         self.reset_election_timer();
 
         // The entries up to `prev_log_index` are already subsumed by our
@@ -1224,6 +1355,7 @@ impl<L: RaftLog> RaftNode<L> {
         // A valid leader for our term: accept its authority.
         self.role = Role::Follower;
         self.leader_id = Some(rpc.leader);
+        self.pre_voting = false;
         self.reset_election_timer();
 
         let snap_index = rpc.snapshot.index;
@@ -1515,7 +1647,7 @@ mod tests {
     }
 
     #[test]
-    fn test_candidate_requests_votes_from_peers() {
+    fn test_candidate_pre_votes_then_requests_votes_from_peers() {
         let mut node = RaftNode::new(RaftConfig::new(1, [2, 3]));
         let mut sends = Vec::new();
         for _ in 0..1_000 {
@@ -1525,8 +1657,35 @@ mod tests {
                 break;
             }
         }
+        // A timeout opens a pre-vote round (the node is not yet a candidate, and
+        // its term has not moved) — PreVotes go to both peers.
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.term(), 0);
+        let pre_targets: Vec<NodeId> = sends
+            .iter()
+            .filter_map(|a| match a {
+                Action::Send {
+                    to,
+                    message: Message::PreVote(_),
+                } => Some(*to),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pre_targets.len(), 2);
+        assert!(pre_targets.contains(&2) && pre_targets.contains(&3));
+
+        // Granting one pre-vote reaches a quorum and starts the real election:
+        // now the term advances and RequestVotes go out to both peers.
+        let actions = node
+            .step(Event::Message(Message::PreVoteReply(PreVoteReply {
+                term: node.term(),
+                vote_granted: true,
+                from: 2,
+            })))
+            .unwrap();
         assert_eq!(node.role(), Role::Candidate);
-        let targets: Vec<NodeId> = sends
+        assert_eq!(node.term(), 1);
+        let targets: Vec<NodeId> = actions
             .iter()
             .filter_map(|a| match a {
                 Action::Send {
@@ -1538,6 +1697,66 @@ mod tests {
             .collect();
         assert_eq!(targets.len(), 2);
         assert!(targets.contains(&2) && targets.contains(&3));
+    }
+
+    #[test]
+    fn test_pre_vote_does_not_advance_term_or_persist() {
+        // Repeated timeouts with no peers reachable must not inflate the term —
+        // the disruption guard. A lone voter in a 3-node config never gets a
+        // pre-vote quorum, so it pre-votes forever at term 0.
+        let mut node = RaftNode::new(RaftConfig::new(1, [2, 3]).with_election_timeout(2, 2));
+        for _ in 0..50 {
+            let _ = node.step(Event::Tick).unwrap();
+        }
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.term(), 0);
+        assert_eq!(node.log().hard_state().term, 0);
+    }
+
+    #[test]
+    fn test_pre_vote_granted_when_no_leader_and_log_ok() {
+        let mut node = RaftNode::new(RaftConfig::new(1, [2, 3]));
+        let actions = node
+            .step(Event::Message(Message::PreVote(PreVote {
+                term: 1,
+                candidate: 2,
+                last_log_index: 0,
+                last_log_term: 0,
+            })))
+            .unwrap();
+        let granted = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::Send { message: Message::PreVoteReply(r), .. } if r.vote_granted
+            )
+        });
+        assert!(granted);
+        // A pre-vote leaves the responder's term and vote untouched.
+        assert_eq!(node.term(), 0);
+        assert_eq!(node.log().hard_state().voted_for, None);
+    }
+
+    #[test]
+    fn test_pre_vote_denied_for_behind_log() {
+        // Responder holds a term-2 entry; a candidate with an empty log is behind.
+        let mut log = MemoryLog::new();
+        log.append(&[entry(2, 1)]).unwrap();
+        let mut node = RaftNode::with_log(RaftConfig::new(1, [2, 3]), log);
+        let actions = node
+            .step(Event::Message(Message::PreVote(PreVote {
+                term: 1,
+                candidate: 2,
+                last_log_index: 0,
+                last_log_term: 0,
+            })))
+            .unwrap();
+        let granted = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::Send { message: Message::PreVoteReply(r), .. } if r.vote_granted
+            )
+        });
+        assert!(!granted);
     }
 
     #[test]
@@ -1630,16 +1849,25 @@ mod tests {
         assert_eq!(node.role(), Role::Follower);
     }
 
-    /// Elects node 1 leader of a `{1,2,3}` cluster by triggering its election
-    /// and feeding it a granting vote from node 2 (self + 1 = quorum of 2).
+    /// Elects node 1 leader of a `{1,2,3}` cluster: tick until it opens a
+    /// pre-vote round, grant the pre-vote from node 2 (which starts the real
+    /// election), then grant the real vote from node 2 (self + 1 = quorum of 2).
     fn elect_multi_node_leader() -> RaftNode {
         let mut node = RaftNode::new(RaftConfig::new(1, [2, 3]).with_heartbeat_interval(2));
         for _ in 0..1_000 {
             let actions = node.step(Event::Tick).expect("tick");
             if !actions.is_empty() {
-                break; // became a candidate and sent RequestVotes
+                break; // opened a pre-vote round and sent PreVotes
             }
         }
+        // Pre-vote does not advance the term; the reply carries the responder's.
+        let _ = node
+            .step(Event::Message(Message::PreVoteReply(PreVoteReply {
+                term: node.term(),
+                vote_granted: true,
+                from: 2,
+            })))
+            .expect("pre-vote reply");
         assert_eq!(node.role(), Role::Candidate);
         let term = node.term();
         let _ = node
@@ -1893,7 +2121,8 @@ mod tests {
             RaftNode::with_log(RaftConfig::new(1, [2]).with_election_timeout(5, 5), log);
         let mut follower = RaftNode::new(RaftConfig::new(2, [1]));
 
-        // Elect leader 1 (2-node quorum is 2; feed a granting vote from 2).
+        // Elect leader 1 (2-node quorum is 2). Tick to a pre-vote round, grant the
+        // pre-vote from 2 to start the real election, then grant the real vote.
         let mut pending = Vec::new();
         for _ in 0..50 {
             let acts = leader.step(Event::Tick).unwrap();
@@ -1902,6 +2131,13 @@ mod tests {
                 break;
             }
         }
+        let _ = leader
+            .step(Event::Message(Message::PreVoteReply(PreVoteReply {
+                term: leader.term(),
+                vote_granted: true,
+                from: 2,
+            })))
+            .unwrap();
         // The candidate's term is now 2; grant it.
         let _ = leader
             .step(Event::Message(Message::RequestVoteReply(
@@ -2111,10 +2347,18 @@ mod tests {
         .unwrap();
         let mut node =
             RaftNode::with_log(RaftConfig::new(1, [2, 3]).with_election_timeout(5, 5), log);
-        // Drive an election and win it.
+        // Drive an election and win it. Grant the pre-vote (starts the real
+        // election) and then the real vote; each is ignored unless it applies.
         let mut elected = false;
         for _ in 0..50 {
             let _ = node.step(Event::Tick).unwrap();
+            let _ = node
+                .step(Event::Message(Message::PreVoteReply(PreVoteReply {
+                    term: node.term(),
+                    vote_granted: true,
+                    from: 2,
+                })))
+                .unwrap();
             if node.role() == Role::Candidate {
                 let _ = node
                     .step(Event::Message(Message::RequestVoteReply(

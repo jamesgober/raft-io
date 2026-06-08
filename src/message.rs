@@ -51,6 +51,72 @@ pub struct RequestVote {
     pub force: bool,
 }
 
+/// A candidate's *pre-vote* probe, sent before it commits to a real election.
+///
+/// Pre-voting (Raft thesis §9.6) is a disruption guard. Before a node increments
+/// its term and campaigns for real, it asks its peers whether they *would* vote
+/// for it at the next term — without bumping anyone's term. A peer grants only if
+/// it has no active leader and the candidate's log is up to date (the same
+/// election restriction a real vote applies). The candidate runs a real
+/// [`RequestVote`] election only once a quorum of pre-votes says yes.
+///
+/// The point is that a node partitioned away from the cluster never collects a
+/// pre-vote majority, so it never inflates its term. When it rejoins it does not
+/// force the established leader to step down, which is the disruption a plain
+/// election would cause. Unlike [`RequestVote`], a pre-vote changes no persistent
+/// state on either side.
+///
+/// # Examples
+///
+/// ```
+/// use raft_io::PreVote;
+///
+/// // The `term` is the *hypothetical* term the candidate would campaign at —
+/// // one past its current term — not a term it has adopted.
+/// let pv = PreVote { term: 5, candidate: 2, last_log_index: 9, last_log_term: 3 };
+/// assert_eq!(pv.candidate, 2);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "framing", derive(pack_io::Serialize, pack_io::Deserialize))]
+pub struct PreVote {
+    /// The hypothetical term the candidate would campaign at — one past its
+    /// current term. It is *not* a term the candidate has adopted; a recipient
+    /// neither stores it nor steps down for it.
+    pub term: Term,
+    /// The candidate seeking the pre-vote.
+    pub candidate: NodeId,
+    /// Index of the candidate's last log entry.
+    pub last_log_index: Index,
+    /// Term of the candidate's last log entry.
+    pub last_log_term: Term,
+}
+
+/// A peer's response to a [`PreVote`].
+///
+/// `term` is the responder's *current* term, unchanged by the pre-vote. If it
+/// exceeds the pre-candidate's term, the pre-candidate has fallen behind and
+/// abandons the round; otherwise `vote_granted` tells it whether this peer would
+/// support a real election. None of this touches persistent state.
+///
+/// # Examples
+///
+/// ```
+/// use raft_io::PreVoteReply;
+///
+/// let reply = PreVoteReply { term: 4, vote_granted: true, from: 3 };
+/// assert!(reply.vote_granted);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "framing", derive(pack_io::Serialize, pack_io::Deserialize))]
+pub struct PreVoteReply {
+    /// The responder's current term, unchanged by the pre-vote.
+    pub term: Term,
+    /// Whether the responder would grant a real vote under these conditions.
+    pub vote_granted: bool,
+    /// The node that produced this reply.
+    pub from: NodeId,
+}
+
 /// A peer's response to a [`RequestVote`].
 ///
 /// `from` names the responder so the candidate can count distinct votes without
@@ -267,6 +333,10 @@ pub struct TimeoutNow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "framing", derive(pack_io::Serialize, pack_io::Deserialize))]
 pub enum Message {
+    /// A candidate is probing for support before a real election.
+    PreVote(PreVote),
+    /// A peer is answering a pre-vote probe.
+    PreVoteReply(PreVoteReply),
     /// A candidate is asking for a vote.
     RequestVote(RequestVote),
     /// A peer is answering a vote request.
@@ -309,6 +379,8 @@ impl Message {
     #[must_use]
     pub fn term(&self) -> Term {
         match self {
+            Self::PreVote(m) => m.term,
+            Self::PreVoteReply(m) => m.term,
             Self::RequestVote(m) => m.term,
             Self::RequestVoteReply(m) => m.term,
             Self::AppendEntries(m) => m.term,

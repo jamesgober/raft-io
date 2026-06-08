@@ -69,8 +69,8 @@ mod tests {
 
     use super::*;
     use crate::message::{
-        AppendEntries, AppendEntriesReply, InstallSnapshot, InstallSnapshotReply, RequestVote,
-        RequestVoteReply, TimeoutNow,
+        AppendEntries, AppendEntriesReply, InstallSnapshot, InstallSnapshotReply, PreVote,
+        PreVoteReply, RequestVote, RequestVoteReply, TimeoutNow,
     };
     use crate::types::{LogEntry, Snapshot};
 
@@ -81,6 +81,17 @@ mod tests {
 
     #[test]
     fn test_every_message_variant_round_trips() {
+        round_trip(Message::PreVote(PreVote {
+            term: 4,
+            candidate: 2,
+            last_log_index: 9,
+            last_log_term: 3,
+        }));
+        round_trip(Message::PreVoteReply(PreVoteReply {
+            term: 4,
+            vote_granted: true,
+            from: 3,
+        }));
         round_trip(Message::RequestVote(RequestVote {
             term: 4,
             candidate: 2,

@@ -18,10 +18,12 @@
 
 > Complete reference for every public item in `raft-io`, with examples.
 >
-> **Status: pre-1.0 (`v0.7`, feature complete and frozen).** The public traits and
-> the wire and WAL formats are frozen as of v0.7 (see
+> **Status: pre-1.0 (`v0.8`, alpha — feature complete, in consumer integration).**
+> The public traits and the wire and WAL formats are frozen as of v0.7 (see
 > [`PROTOCOL.md`](./PROTOCOL.md)); additions before `1.0` remain
-> backward-compatible. This document is the reference for every public item.
+> backward-compatible — the v0.8 pre-vote messages, for instance, are new
+> `#[non_exhaustive]` enum variants that change no existing encoding. This document
+> is the reference for every public item.
 
 ## Table of Contents
 
@@ -35,10 +37,11 @@
   - [`RaftNode`](#raftnode)
   - [`Event`](#event)
   - [`Action`](#action)
-  - [Messages](#messages) — [`Message`](#message), [`RequestVote`](#requestvote), [`RequestVoteReply`](#requestvotereply), [`AppendEntries`](#appendentries), [`AppendEntriesReply`](#appendentriesreply), [`InstallSnapshot`](#installsnapshot), [`InstallSnapshotReply`](#installsnapshotreply)
+  - [Messages](#messages) — [`Message`](#message), [`PreVote`](#prevote), [`PreVoteReply`](#prevotereply), [`RequestVote`](#requestvote), [`RequestVoteReply`](#requestvotereply), [`AppendEntries`](#appendentries), [`AppendEntriesReply`](#appendentriesreply), [`InstallSnapshot`](#installsnapshot), [`InstallSnapshotReply`](#installsnapshotreply)
   - [`RaftLog`](#raftlog), [`MemoryLog`](#memorylog) & [`WalLog`](#wallog)
   - [`RaftTransport`](#rafttransport) & [`MemoryTransport`](#memorytransport)
   - [`Error`](#error), [`Result`](#result) & [`framing`](#framing)
+  - [`prelude`](#prelude)
 - [Feature flags](#feature-flags)
 
 ---
@@ -72,11 +75,11 @@ leadership ([`Event::TransferLeadership`](#event)). The `framing` feature adds
 
 ```toml
 [dependencies]
-raft-io = "0.7"
+raft-io = "0.8"
 
 # Optional features:
-raft-io = { version = "0.7", features = ["persistence"] } # durable wal-db-backed `WalLog`
-raft-io = { version = "0.7", features = ["framing"] }     # pack-io wire framing for messages
+raft-io = { version = "0.8", features = ["persistence"] } # durable wal-db-backed `WalLog`
+raft-io = { version = "0.8", features = ["framing"] }     # pack-io wire framing for messages
 ```
 
 MSRV: Rust 1.85 (edition 2024).
@@ -551,6 +554,8 @@ time.
 ```rust
 #[non_exhaustive]
 pub enum Message {
+    PreVote(PreVote),
+    PreVoteReply(PreVoteReply),
     RequestVote(RequestVote),
     RequestVoteReply(RequestVoteReply),
     AppendEntries(AppendEntries),
@@ -578,6 +583,41 @@ let m = Message::AppendEntriesReply(AppendEntriesReply {
 });
 assert_eq!(m.term(), 5);
 ```
+
+#### `PreVote`
+
+```rust
+pub struct PreVote {
+    pub term: Term,
+    pub candidate: NodeId,
+    pub last_log_index: Index,
+    pub last_log_term: Term,
+}
+```
+
+A candidate's pre-vote probe, sent before it commits to a real election (Raft
+thesis §9.6). `term` is the *hypothetical* term the candidate would campaign at —
+one past its current term — **not** a term it has adopted. A peer grants only if
+it recognises no active leader and the candidate's log is at least as up to date
+as its own; unlike [`RequestVote`](#requestvote), a pre-vote changes no persistent
+state on either side. A node partitioned from the cluster never wins a pre-vote
+majority, so its term never inflates and it cannot disrupt the sitting leader when
+it rejoins — that is the entire point.
+
+#### `PreVoteReply`
+
+```rust
+pub struct PreVoteReply {
+    pub term: Term,
+    pub vote_granted: bool,
+    pub from: NodeId,
+}
+```
+
+A peer's answer to a [`PreVote`](#prevote). `term` is the responder's current term
+(unchanged by the pre-vote); if it exceeds the pre-candidate's term, the
+pre-candidate has fallen behind and abandons the round. `vote_granted` says
+whether the peer would support a real election.
 
 #### `RequestVote`
 
@@ -934,6 +974,36 @@ let msg = Message::RequestVote(RequestVote {
 let bytes = framing::encode(&msg).unwrap();
 assert_eq!(framing::decode(&bytes).unwrap(), msg);
 # }
+```
+
+---
+
+### `prelude`
+
+```rust
+use raft_io::prelude::*;
+```
+
+The everyday surface in one import: [`RaftNode`](#raftnode),
+[`RaftConfig`](#raftconfig), the [`Event`](#event) / [`Action`](#action)
+vocabulary, [`Error`](#error) / [`Result`](#result), the
+[`RaftLog`](#raftlog) / [`RaftTransport`](#rafttransport) seams with their
+in-memory implementations ([`MemoryLog`](#memorylog),
+[`MemoryTransport`](#memorytransport) is *not* re-exported — bring it in
+explicitly when needed), and the [`NodeId`](#nodeid--term--index) /
+[`Term`](#nodeid--term--index) / [`Index`](#nodeid--term--index) /
+[`Role`](#role) aliases. With the `persistence` feature it also re-exports
+[`WalLog`](#wallog). The message and other value types stay at the crate root,
+for when you implement a transport or inspect a [`LogEntry`](#logentry).
+
+```rust
+use raft_io::prelude::*;
+
+let mut node = RaftNode::new(RaftConfig::single(1));
+while !node.is_leader() {
+    let _ = node.step(Event::Tick).unwrap();
+}
+assert!(node.is_leader());
 ```
 
 ---

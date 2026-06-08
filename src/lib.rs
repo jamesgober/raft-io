@@ -14,15 +14,21 @@
 //!
 //! ## Status
 //!
-//! This is `v0.7`: **feature complete, hardened, and frozen.** The full protocol
-//! — election, replication, durable crash recovery (`persistence`), snapshots,
+//! This is `v0.8`: **alpha — feature complete, hardened, in consumer
+//! integration.** The full protocol — election (with [pre-vote] disruption
+//! protection), replication, durable crash recovery (`persistence`), snapshots,
 //! membership changes, and leadership transfer — is in place and verified by a
 //! kitchen-sink adversarial test suite that asserts all five Raft safety
 //! properties under combined partitions, message loss/reorder/duplication,
-//! membership churn, and snapshotting. The public traits and the wire and WAL
-//! formats are frozen (see `docs/PROTOCOL.md`); the decode path is fuzzed.
-//! Alpha/beta hardening against real consumers follows in `v0.8`+. See
-//! `docs/API.md` for the full surface.
+//! membership churn, and snapshotting, plus an application-level suite that
+//! drives a replicated key-value store to convergence under the same faults. The
+//! public traits and the wire and WAL formats are frozen (see `docs/PROTOCOL.md`);
+//! the decode path is fuzzed. Additions in this line stay MINOR-compatible — the
+//! pre-vote messages, for instance, are new `#[non_exhaustive]` enum variants that
+//! leave every existing wire and WAL encoding untouched. See `docs/API.md` for the
+//! full surface.
+//!
+//! [pre-vote]: PreVote
 //!
 //! ## The three tiers
 //!
@@ -87,8 +93,8 @@ pub use crate::config::RaftConfig;
 pub use crate::error::{Error, Result};
 pub use crate::log::{MemoryLog, RaftLog};
 pub use crate::message::{
-    AppendEntries, AppendEntriesReply, InstallSnapshot, InstallSnapshotReply, Message, RequestVote,
-    RequestVoteReply, TimeoutNow,
+    AppendEntries, AppendEntriesReply, InstallSnapshot, InstallSnapshotReply, Message, PreVote,
+    PreVoteReply, RequestVote, RequestVoteReply, TimeoutNow,
 };
 pub use crate::node::{Action, Event, RaftNode};
 pub use crate::transport::{MemoryTransport, RaftTransport};
@@ -96,3 +102,31 @@ pub use crate::types::{EntryKind, HardState, Index, LogEntry, NodeId, Role, Snap
 #[cfg(feature = "persistence")]
 #[cfg_attr(docsrs, doc(cfg(feature = "persistence")))]
 pub use crate::wal_log::WalLog;
+
+/// The everyday surface, for `use raft_io::prelude::*;`.
+///
+/// This gathers the types an application touches while driving a node — the node
+/// and its config, the [`Event`]/[`Action`] vocabulary, the error type, and the
+/// log and transport seams with their in-memory implementations. The message and
+/// other value types are available from the crate root when needed (for example
+/// when implementing a transport or inspecting a [`LogEntry`]).
+///
+/// # Examples
+///
+/// ```
+/// use raft_io::prelude::*;
+///
+/// let mut node = RaftNode::new(RaftConfig::single(1));
+/// while !node.is_leader() {
+///     let _ = node.step(Event::Tick).unwrap();
+/// }
+/// assert!(node.is_leader());
+/// ```
+pub mod prelude {
+    #[cfg(feature = "persistence")]
+    pub use crate::WalLog;
+    pub use crate::{
+        Action, Error, Event, Index, MemoryLog, NodeId, RaftConfig, RaftLog, RaftNode,
+        RaftTransport, Result, Role, Term,
+    };
+}

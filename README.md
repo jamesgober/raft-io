@@ -58,11 +58,11 @@
 
 ```toml
 [dependencies]
-raft-io = "0.7"
+raft-io = "0.8"
 
 # Optional features:
-raft-io = { version = "0.7", features = ["persistence"] } # durable wal-db-backed `WalLog`
-raft-io = { version = "0.7", features = ["framing"] }     # pack-io wire framing for messages
+raft-io = { version = "0.8", features = ["persistence"] } # durable wal-db-backed `WalLog`
+raft-io = { version = "0.8", features = ["framing"] }     # pack-io wire framing for messages
 ```
 
 <br>
@@ -111,6 +111,7 @@ cargo run --example replicated_log      # propose + replicate; all nodes agree
 cargo run --example partition_recovery  # minority stalls, majority commits, heal
 cargo run --example snapshot_catchup    # leader compacts; lagging node catches up via snapshot
 cargo run --example membership          # add a node, remove a node, transfer leadership
+cargo run --example kv_store            # a replicated key-value store, end to end
 cargo run --example persistent_node --features persistence  # log survives a restart
 ```
 
@@ -118,16 +119,20 @@ cargo run --example persistent_node --features persistence  # log survives a res
 
 ## Status
 
-This is `v0.7.0`: **feature complete, hardened, and frozen.** The full protocol —
-election, replication, durable crash recovery, snapshots, membership changes, and
-leadership transfer — is in place. A kitchen-sink adversarial test suite drives
-clusters through combined partitions, message loss/reorder/duplication, membership
-churn, and snapshotting, and asserts all five Raft safety properties (Election
-Safety, Leader Append-Only, Log Matching, Leader Completeness, State Machine
-Safety) continuously over sustained runs; the decode path is fuzzed. The public
-traits and the wire and WAL formats are now **frozen** — see the normative
-<a href="./docs/PROTOCOL.md"><code>docs/PROTOCOL.md</code></a>. Alpha/beta hardening
-against real consumers follows in `v0.8`+, per the
+This is `v0.8.0`: **alpha — feature complete, hardened, in consumer integration.**
+The full protocol — election (with pre-vote disruption protection), replication,
+durable crash recovery, snapshots, membership changes, and leadership transfer — is
+in place. A kitchen-sink adversarial test suite drives clusters through combined
+partitions, message loss/reorder/duplication, membership churn, and snapshotting,
+and asserts all five Raft safety properties (Election Safety, Leader Append-Only,
+Log Matching, Leader Completeness, State Machine Safety) continuously over sustained
+runs; a companion suite drives a replicated key-value store — the library's first
+real consumer — to identical state on every node under the same faults; and the
+decode path is fuzzed. The public traits and the wire and WAL formats are **frozen**
+— see the normative <a href="./docs/PROTOCOL.md"><code>docs/PROTOCOL.md</code></a>;
+additions in the 0.x line stay MINOR-compatible (the pre-vote messages are new
+<code>#[non_exhaustive]</code> enum variants that change no existing encoding). Beta
+and RC hardening follow toward the `1.0` freeze, per the
 <a href="./.dev/ROADMAP.md"><code>ROADMAP</code></a> (development copy). The full
 public surface is documented in <a href="./docs/API.md"><code>docs/API.md</code></a>.
 

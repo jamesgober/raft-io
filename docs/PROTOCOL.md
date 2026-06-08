@@ -30,6 +30,9 @@ and the durable WAL record format are **frozen**: they will not change in a
 backward-incompatible way before `2.0`. New message variants or record tags MAY be
 added (the relevant enums are `#[non_exhaustive]` and the framing prepends a
 variant tag), but existing variants, fields, tags, and their meanings are fixed.
+The `PreVote` / `PreVoteReply` messages added in **v0.8** are exactly such a
+backward-compatible addition: new enum variants that leave every prior message's
+encoding untouched.
 
 This document is the authority for those formats. It is based on Diego Ongaro's
 Raft (the dissertation, *Consensus: Bridging Theory and Practice*); section
@@ -97,15 +100,43 @@ ignore a trailing partial 8-byte group (only reachable through corruption).
 
 A follower that reaches a randomised election timeout (chosen per node from a
 seeded generator so the protocol stays deterministic) and is a voting member
-becomes a candidate: it increments `current_term`, votes for itself, persists the
-hard state, and sends `RequestVote` to every other voter. A candidate that
-collects votes from a **majority of the current configuration** becomes leader.
+seeks leadership. It does so in two phases: a **pre-vote** probe (§3.3.1) and then,
+if that succeeds, a real election. In the real election it increments
+`current_term`, votes for itself, persists the hard state, and sends `RequestVote`
+to every other voter. A candidate that collects votes from a **majority of the
+current configuration** becomes leader.
 
 A node grants a vote iff: the request's term is not stale; the node has not
 already voted for a different candidate in that term; and the candidate's log is
 **at least as up to date** as the node's own — a higher last-log term wins, or an
 equal last-log term with at least as high a last index (§5.4.1). A node MUST
 persist `voted_for` before replying that it granted.
+
+#### 3.3.1 Pre-vote (§9.6)
+
+Before a real election, a voter that times out SHOULD run a pre-vote round: it
+sends `PreVote` to every other voter carrying the **hypothetical** term it would
+campaign at (one past its current term) and its last-log position, **without**
+incrementing its own term, casting a vote, or persisting anything. It remains a
+follower for the duration.
+
+A node grants a pre-vote iff it would grant a real vote under the same conditions:
+the hypothetical term is not behind its own, the candidate's log is at least as up
+to date (§5.4.1), and leader stickiness (§3.4) does not apply — that is, it does
+not currently recognise an active leader. A `PreVoteReply` reports the responder's
+unchanged current term and whether it would grant. Because no state is consumed, a
+node MAY grant pre-votes to several candidates in the same term; only the real
+`RequestVote` consumes its single vote.
+
+Only once the pre-candidate collects pre-votes from a **majority of the current
+configuration** does it start the real election (above). A `PreVoteReply` carrying
+a higher term means the pre-candidate has fallen behind: it MUST abandon the round
+and adopt that term as a follower.
+
+Pre-vote is the disruption guard: a node partitioned from the cluster never
+collects a pre-vote majority, so its term never climbs, and on rejoin it cannot
+force the established leader to step down. A forced election (`TimeoutNow`, §7)
+skips pre-vote, since the leader has already vouched for the target.
 
 ### 3.4 Leader stickiness (§4.2.3)
 
@@ -155,6 +186,8 @@ new state. Honouring the order in which actions are returned is sufficient.
 
 | Message | Direction | Purpose |
 |---|---|---|
+| `PreVote { term, candidate, last_log_index, last_log_term }` | candidate → voters | Probe support before a real election (§3.3.1). `term` is hypothetical. |
+| `PreVoteReply { term, vote_granted, from }` | voter → candidate | Would-grant, without changing state. |
 | `RequestVote { term, candidate, last_log_index, last_log_term, force }` | candidate → voters | Solicit a vote. |
 | `RequestVoteReply { term, vote_granted, from }` | voter → candidate | Grant or deny. |
 | `AppendEntries { term, leader, prev_log_index, prev_log_term, entries, leader_commit }` | leader → follower | Replicate / heartbeat. |
@@ -164,9 +197,11 @@ new state. Honouring the order in which actions are returned is sufficient.
 | `TimeoutNow { term, leader }` | leader → target | Trigger an immediate (forced) election (§7). |
 
 A node that receives any message with a term greater than its own MUST adopt that
-term and revert to follower before handling the message (except where leader
-stickiness applies to `RequestVote`, §3.4). A node MUST ignore a reply whose term
-does not match its current term.
+term and revert to follower before handling the message — **except** where leader
+stickiness applies to `RequestVote` (§3.4), and except for `PreVote` /
+`PreVoteReply`, which are hypothetical and MUST NOT cause the receiver to adopt
+the carried term (§3.3.1). A node MUST ignore a reply whose term does not match
+its current term.
 
 ## 5. Snapshots and compaction
 
