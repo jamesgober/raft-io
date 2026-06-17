@@ -19,6 +19,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.10.1] - 2026-06-08
+
+Release-candidate hardening: performance baselines and an extended soak. No
+library code or public API changed.
+
+### Added
+
+- A committed performance baseline. The `criterion` benchmark suite
+  (`benches/raft_bench.rs`) now covers every hot path of
+  [`RaftNode::step`](https://docs.rs/raft-io): the steady-state follower and
+  leader-heartbeat ticks, a follower applying a batch, a leader committing on a
+  follower's acknowledgement, a single-node proposal, an inbound vote, a
+  linearizable read, and a snapshot install. `docs/BENCHMARKS.md` records the
+  reference numbers, methodology, and the 5%-regression policy (REPS).
+- Extended soak: the full property suite — including the jepsen-style hardening
+  nemesis and the key-value consumer — was run at elevated case counts
+  (`PROPTEST_CASES=2000`–`6000`) with no failure.
+
+---
+
 ## [0.10.0] - 2026-06-08
 
 Beta: non-voting learner members. All additions are MINOR-compatible — no
@@ -378,7 +398,8 @@ Initial scaffold and repository bootstrap. No raft-io logic yet &mdash; this rel
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/jamesgober/raft-io/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/jamesgober/raft-io/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/jamesgober/raft-io/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/raft-io/compare/v0.7.0...v0.8.0

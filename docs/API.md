@@ -11,6 +11,8 @@
         <span>&nbsp;│&nbsp;</span>
         <a href="./PROTOCOL.md" title="Protocol Specification"><b>PROTOCOL</b></a>
         <span>&nbsp;│&nbsp;</span>
+        <a href="./BENCHMARKS.md" title="Performance Baselines"><b>BENCHMARKS</b></a>
+        <span>&nbsp;│&nbsp;</span>
         <a href="../CHANGELOG.md" title="Changelog"><b>CHANGELOG</b></a>
     </sup>
 </div>

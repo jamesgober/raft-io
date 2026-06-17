@@ -10,6 +10,8 @@
         <a href="./API.md" title="API Reference"><b>API</b></a>
         <span>&nbsp;│&nbsp;</span>
         <span>PROTOCOL</span>
+        <span>&nbsp;│&nbsp;</span>
+        <a href="./BENCHMARKS.md" title="Performance Baselines"><b>BENCHMARKS</b></a>
     </sup>
 </div>
 <br>

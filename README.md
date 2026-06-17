@@ -134,8 +134,10 @@ the decode path is fuzzed. The public traits and the wire and WAL formats are
 <a href="./docs/PROTOCOL.md"><code>docs/PROTOCOL.md</code></a>; additions in the 0.x
 line stay MINOR-compatible (the pre-vote and read-probe messages are new
 <code>#[non_exhaustive]</code> enum variants, and the learner encoding is
-byte-identical to earlier versions when no learners are used). RC hardening and final
-benchmarks follow toward the `1.0` freeze, per the
+byte-identical to earlier versions when no learners are used). Committed
+performance baselines for the hot path live in
+<a href="./docs/BENCHMARKS.md"><code>docs/BENCHMARKS.md</code></a>; a final docs and
+spec pass is all that remains before the `1.0` freeze, per the
 <a href="./.dev/ROADMAP.md"><code>ROADMAP</code></a> (development copy). The full
 public surface is documented in <a href="./docs/API.md"><code>docs/API.md</code></a>.
 
