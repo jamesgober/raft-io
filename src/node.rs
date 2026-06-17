@@ -1,28 +1,27 @@
 //! The deterministic protocol core: [`RaftNode`], [`Event`], and [`Action`].
 //!
 //! A [`RaftNode`] is a pure state machine. You drive it with [`step`], handing
-//! it one [`Event`] — a logical [`Tick`], an inbound [`Message`], or a client
-//! [`Propose`] — and it returns the [`Action`]s the outside world must carry
-//! out: messages to send and committed commands to apply. It never reads a
-//! clock, opens a socket, or touches a disk; all of that is the caller's job,
-//! reached through the [`RaftLog`] it owns and the
-//! [`RaftTransport`](crate::RaftTransport) the caller drives. That is what makes
-//! the protocol reproducible from a seed and a sequence of events.
+//! it one [`Event`] — a logical [`Tick`], an inbound [`Message`], a client
+//! [`Propose`], a membership change, or a linearizable [`Read`] — and it returns
+//! the [`Action`]s the outside world must carry out: messages to send and
+//! committed commands to apply. It never reads a clock, opens a socket, or
+//! touches a disk; all of that is the caller's job, reached through the
+//! [`RaftLog`] it owns and the [`RaftTransport`](crate::RaftTransport) the caller
+//! drives. That is what makes the protocol reproducible from a seed and a
+//! sequence of events.
 //!
-//! # Scope at v0.5
-//!
-//! The protocol is feature-complete bar membership changes (`v0.6`): leader
-//! election with term and vote safety, the full replication pipeline (batched
-//! `AppendEntries`, per-follower progress with optimistic pipelining,
-//! conflict-hint backtracking, commit on a quorum), durable persistence and
-//! crash recovery (the `WalLog`), and **snapshots with log compaction** — a
-//! policy hint drives the application to snapshot, the log compacts behind it,
-//! and a follower too far behind to replicate is caught up with an
-//! `InstallSnapshot`.
+//! The whole protocol lives here: leader election with term and vote safety and
+//! [pre-vote](crate::PreVote) disruption protection, the full replication
+//! pipeline (batched `AppendEntries`, per-follower progress with optimistic
+//! pipelining, conflict-hint backtracking, commit on a quorum), durable
+//! persistence and crash recovery (the [`WalLog`](crate::WalLog)), snapshots with
+//! log compaction, single-server membership changes with non-voting learners,
+//! leadership transfer, and linearizable reads via the ReadIndex protocol.
 //!
 //! [`step`]: RaftNode::step
 //! [`Tick`]: Event::Tick
 //! [`Propose`]: Event::Propose
+//! [`Read`]: Event::Read
 //! [`Message`]: crate::Message
 //! [`AppendEntries`]: crate::AppendEntries
 //! [`RaftLog`]: crate::RaftLog
@@ -394,7 +393,8 @@ impl<L: RaftLog> RaftNode<L> {
     /// Creates a node from `config` backed by a caller-supplied `log`.
     ///
     /// This is the Tier-3 entry point: provide any [`RaftLog`] implementation —
-    /// for example a durable, `wal-db`-backed store (`v0.4`). The node adopts
+    /// for example a durable, `wal-db`-backed store ([`WalLog`](crate::WalLog),
+    /// under the `persistence` feature). The node adopts
     /// the log's persisted [`HardState`](crate::HardState) on construction, so a
     /// store recovered from disk resumes in the term it last persisted and with
     /// the vote it last cast.
@@ -2309,7 +2309,7 @@ mod tests {
         );
     }
 
-    // ---- v0.3 replication --------------------------------------------------
+    // ---- replication --------------------------------------------------
 
     fn entry(term: Term, index: Index) -> LogEntry {
         LogEntry::new(term, index, vec![index as u8])
@@ -2651,7 +2651,7 @@ mod tests {
         assert_eq!(node.log().hard_state().voted_for, Some(2));
     }
 
-    // ---- v0.5 snapshots ---------------------------------------------------
+    // ---- snapshots ---------------------------------------------------
 
     #[test]
     fn test_snapshot_hint_then_compaction() {
@@ -2830,7 +2830,7 @@ mod tests {
         assert_eq!(node.log().syncs(), before, "a no-op vote must not sync");
     }
 
-    // ---- v0.6 membership changes ------------------------------------------
+    // ---- membership changes ------------------------------------------
 
     fn membership_changed(actions: &[Action]) -> Option<Vec<NodeId>> {
         actions.iter().find_map(|a| match a {
@@ -2935,7 +2935,7 @@ mod tests {
         assert_eq!(membership_changed(&actions), Some(vec![1, 5, 9]));
     }
 
-    // ---- v0.6 leadership transfer -----------------------------------------
+    // ---- leadership transfer -----------------------------------------
 
     #[test]
     fn test_timeout_now_triggers_immediate_election() {
@@ -3006,7 +3006,7 @@ mod tests {
         assert_eq!(node.role(), Role::Follower);
     }
 
-    // ---- v0.9 linearizable reads ------------------------------------------
+    // ---- linearizable reads ------------------------------------------
 
     fn read_ready(actions: &[Action], id: u64) -> Option<Index> {
         actions.iter().find_map(|a| match a {
@@ -3131,7 +3131,7 @@ mod tests {
         assert_eq!(read_ready(&actions, 1), None);
     }
 
-    // ---- v0.10 learner (non-voting) members -------------------------------
+    // ---- learner (non-voting) members -------------------------------
 
     /// Acknowledges an index from a voter so the leader can commit it.
     fn ack(node: &mut RaftNode, from: NodeId, match_index: Index) {

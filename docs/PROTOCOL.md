@@ -26,15 +26,13 @@
 
 ## Status and freeze
 
-As of **v0.7** the public traits ([`RaftLog`](./API.md#raftlog),
-[`RaftTransport`](./API.md#rafttransport)), the message set and its wire framing,
-and the durable WAL record format are **frozen**: they will not change in a
-backward-incompatible way before `2.0`. New message variants or record tags MAY be
-added (the relevant enums are `#[non_exhaustive]` and the framing prepends a
-variant tag), but existing variants, fields, tags, and their meanings are fixed.
-The `PreVote` / `PreVoteReply` messages added in **v0.8** are exactly such a
-backward-compatible addition: new enum variants that leave every prior message's
-encoding untouched.
+This is the **`1.0`** specification. The public API, the message set and its wire
+framing, the durable WAL record format, and the configuration encoding are
+**frozen**: they will not change in a backward-incompatible way before `2.0`. New
+message variants or record tags MAY be added (the relevant enums are
+`#[non_exhaustive]` and the framing prepends a variant tag), but existing variants,
+fields, tags, and their meanings are fixed. A second implementation built to this
+document interoperates with this one on the wire and on disk.
 
 This document is the authority for those formats. It is based on Diego Ongaro's
 Raft (the dissertation, *Consensus: Bridging Theory and Practice*); section
@@ -357,14 +355,13 @@ client retries against the new leader.
 
 ## 12. Versioning
 
-The crate follows semantic versioning. The formats in §4, §8, and §9 and the trait
-seams are frozen as of v0.7 and will not break before `2.0`; additions remain
-backward-compatible via the `#[non_exhaustive]` enums and tagged encodings. The
-`PreVote` / `PreVoteReply` (v0.8) and `ReadProbe` / `ReadProbeReply` (v0.9)
-messages are such additions: new enum variants that leave every prior message's
-encoding untouched. The learner configuration encoding (v0.10, §3.2) is likewise
-compatible: it is byte-identical to the prior format whenever no learners are
-present, and extends it with a reserved separator only when they are.
+The crate follows semantic versioning. As of `1.0` the public API, the formats in
+§4, §8, and §9, and the trait seams are frozen and will not break before `2.0`.
+Any future protocol additions remain backward-compatible via the
+`#[non_exhaustive]` enums and tagged encodings: a new message is a new enum
+variant that leaves every existing message's encoding untouched, and the
+configuration encoding (§3.2) reserves a separator so learner-free configurations
+stay byte-identical to a bare voter set.
 
 ---
 

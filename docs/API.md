@@ -20,13 +20,10 @@
 
 > Complete reference for every public item in `raft-io`, with examples.
 >
-> **Status: pre-1.0 (`v0.10`, beta — feature complete, soaking toward 1.0).** The
-> public traits and the wire and WAL formats are frozen as of v0.7 (see
-> [`PROTOCOL.md`](./PROTOCOL.md)); additions before `1.0` remain
-> backward-compatible — the v0.8 pre-vote and v0.9 read-probe messages are new
-> `#[non_exhaustive]` enum variants, and the v0.10 learner configuration encoding
-> is byte-identical to before when no learners are used. This document is the
-> reference for every public item.
+> **Status: `1.0` — stable.** The public API, the wire format, and the durable log
+> format are frozen and will not change incompatibly before `2.0` (see the
+> normative [`PROTOCOL.md`](./PROTOCOL.md)). This document is the reference for
+> every public item.
 
 ## Table of Contents
 
@@ -40,7 +37,7 @@
   - [`RaftNode`](#raftnode)
   - [`Event`](#event)
   - [`Action`](#action)
-  - [Messages](#messages) — [`Message`](#message), [`PreVote`](#prevote), [`PreVoteReply`](#prevotereply), [`RequestVote`](#requestvote), [`RequestVoteReply`](#requestvotereply), [`AppendEntries`](#appendentries), [`AppendEntriesReply`](#appendentriesreply), [`InstallSnapshot`](#installsnapshot), [`InstallSnapshotReply`](#installsnapshotreply), [`ReadProbe`](#readprobe), [`ReadProbeReply`](#readprobereply)
+  - [Messages](#messages) — [`Message`](#message), [`PreVote`](#prevote), [`PreVoteReply`](#prevotereply), [`RequestVote`](#requestvote), [`RequestVoteReply`](#requestvotereply), [`AppendEntries`](#appendentries), [`AppendEntriesReply`](#appendentriesreply), [`InstallSnapshot`](#installsnapshot), [`InstallSnapshotReply`](#installsnapshotreply), [`TimeoutNow`](#timeoutnow), [`ReadProbe`](#readprobe), [`ReadProbeReply`](#readprobereply)
   - [`RaftLog`](#raftlog), [`MemoryLog`](#memorylog) & [`WalLog`](#wallog)
   - [`RaftTransport`](#rafttransport) & [`MemoryTransport`](#memorytransport)
   - [`Error`](#error), [`Result`](#result) & [`framing`](#framing)
@@ -61,16 +58,19 @@ storage are injected through the [`RaftLog`](#raftlog) and
 [`RaftTransport`](#rafttransport) seams. That separation is what makes the core
 provable — an entire run is reproducible from a seed and a sequence of events.
 
-At `v0.6` the protocol is **feature complete**: leader election with full term and
-vote safety, the complete multi-node log-replication pipeline (batched
-[`AppendEntries`](#appendentries), per-follower progress with optimistic
-pipelining, conflict-hint backtracking, commit on a quorum), durable persistence
-and crash recovery ([`WalLog`](#wallog), `persistence` feature), snapshots with
-log compaction ([`Action::Snapshot`](#action) → [`InstallSnapshot`](#installsnapshot)),
-and **membership changes** — add or remove a voter one server at a time
-([`Event::AddServer`](#event) / [`Event::RemoveServer`](#event)) and transfer
-leadership ([`Event::TransferLeadership`](#event)). The `framing` feature adds
-[`pack-io`](#framing) wire encoding for messages.
+The protocol is **complete**: leader election with full term and vote safety and
+[pre-vote](#prevote) disruption protection, the complete multi-node
+log-replication pipeline (batched [`AppendEntries`](#appendentries), per-follower
+progress with optimistic pipelining, conflict-hint backtracking, commit on a
+quorum), durable persistence and crash recovery ([`WalLog`](#wallog),
+`persistence` feature), snapshots with log compaction
+([`Action::Snapshot`](#action) → [`InstallSnapshot`](#installsnapshot)),
+single-server **membership changes** with non-voting [learners](#learners)
+([`Event::AddServer`](#event) / [`Event::RemoveServer`](#event) /
+[`Event::AddLearner`](#event) / [`Event::PromoteLearner`](#event)), leadership
+transfer ([`Event::TransferLeadership`](#event)), and **linearizable reads** via
+the ReadIndex protocol ([`Event::Read`](#event) → [`Action::ReadReady`](#action)).
+The `framing` feature adds [`pack-io`](#framing) wire encoding for messages.
 
 ---
 
@@ -78,11 +78,11 @@ leadership ([`Event::TransferLeadership`](#event)). The `framing` feature adds
 
 ```toml
 [dependencies]
-raft-io = "0.10"
+raft-io = "1.0"
 
 # Optional features:
-raft-io = { version = "0.10", features = ["persistence"] } # durable wal-db-backed `WalLog`
-raft-io = { version = "0.10", features = ["framing"] }     # pack-io wire framing for messages
+raft-io = { version = "1.0", features = ["persistence"] } # durable wal-db-backed `WalLog`
+raft-io = { version = "1.0", features = ["framing"] }     # pack-io wire framing for messages
 ```
 
 MSRV: Rust 1.85 (edition 2024).
@@ -192,9 +192,17 @@ pub enum EntryKind { Normal, Config }
 ```
 
 What a [`LogEntry`](#logentry) carries. A `Normal` entry is an application command;
-a `Config` entry carries a cluster configuration (the voting membership) and
-drives a membership change — the protocol interprets its bytes and the application
-never applies them.
+a `Config` entry carries a cluster configuration (the voting membership, and any
+non-voting learners) and drives a membership change — the protocol interprets its
+bytes and the application never applies them. `Normal` is the default.
+
+```rust
+use raft_io::{EntryKind, LogEntry};
+
+assert_eq!(LogEntry::new(1, 1, vec![]).kind, EntryKind::Normal);
+assert_eq!(LogEntry::config(1, 2, &[1, 2, 3]).kind, EntryKind::Config);
+assert_eq!(EntryKind::default(), EntryKind::Normal);
+```
 
 #### `LogEntry`
 
@@ -216,19 +224,32 @@ an entry uniquely.
 
 | Item | Signature | Description |
 |---|---|---|
-| `new` | `fn new(term, index, command: Vec<u8>) -> LogEntry` | A `Normal` command entry. |
-| `config` | `fn config(term, index, members: &[NodeId]) -> LogEntry` | A `Config` entry carrying `members`. |
-| `members` | `fn members(&self) -> Option<Vec<NodeId>>` | The membership of a `Config` entry, or `None` for a `Normal` one. |
+| `new` | `fn new(term, index, command: Vec<u8>) -> LogEntry` | A `Normal` command entry. `command` is the opaque application payload. |
+| `config` | `fn config(term, index, members: &[NodeId]) -> LogEntry` | A `Config` entry whose voting membership is `members` (no learners). |
+| `config_with_learners` | `fn config_with_learners(term, index, voters: &[NodeId], learners: &[NodeId]) -> LogEntry` | A `Config` entry carrying both `voters` and non-voting `learners`. Byte-identical to `config` when `learners` is empty. |
+| `members` | `fn members(&self) -> Option<Vec<NodeId>>` | The voting membership of a `Config` entry, or `None` for a `Normal` one. |
+| `learners` | `fn learners(&self) -> Option<Vec<NodeId>>` | The non-voting learners of a `Config` entry (empty if none), or `None` for a `Normal` one. |
+
+In every constructor, `term` is the term the leader created the entry in and
+`index` is its 1-based position in the log.
 
 ```rust
 use raft_io::{EntryKind, LogEntry};
 
+// A normal application command.
 let entry = LogEntry::new(2, 7, b"put k v".to_vec());
 assert_eq!(entry.kind, EntryKind::Normal);
 assert_eq!(entry.members(), None);
 
+// A configuration entry: three voters, no learners.
 let cfg = LogEntry::config(3, 9, &[1, 2, 3]);
 assert_eq!(cfg.members(), Some(vec![1, 2, 3]));
+assert_eq!(cfg.learners(), Some(vec![]));
+
+// A configuration entry with a non-voting learner.
+let with_learner = LogEntry::config_with_learners(3, 9, &[1, 2, 3], &[4]);
+assert_eq!(with_learner.members(), Some(vec![1, 2, 3]));
+assert_eq!(with_learner.learners(), Some(vec![4]));
 ```
 
 #### `HardState`
@@ -383,13 +404,18 @@ produce the same actions.
 
 **Parameters**
 
-- `event` — the input: [`Event::Tick`](#event), [`Event::Message`](#event), or
-  [`Event::Propose`](#event).
+- `event` — the input to apply. Any [`Event`](#event) variant: a `Tick`, an
+  inbound `Message`, a client `Propose`, a `Snapshot` reply, a membership change
+  (`AddServer` / `RemoveServer` / `AddLearner` / `PromoteLearner`),
+  `TransferLeadership`, or a linearizable `Read`.
 
 **Errors**
 
-- [`Error::NotLeader`](#error) — the event was a `Propose` and this node is not
-  the leader; the error carries the known leader so the caller can redirect.
+- [`Error::NotLeader`](#error) — the event required the leader (`Propose`, a
+  membership change, or `Read`) and this node is not the leader; the error carries
+  the known leader so the caller can redirect.
+- [`Error::ConfigInProgress`](#error) — a membership change was requested while a
+  previous one is still uncommitted.
 - [`Error::Storage`](#error) — the underlying [`RaftLog`](#raftlog) failed on the
   durability path. Fatal to the node.
 
@@ -500,8 +526,10 @@ use raft_io::{Event, Message, RequestVote};
 
 let _tick = Event::Tick;
 let _propose = Event::Propose(b"cmd".to_vec());
+let _read = Event::Read { id: 7 };
+let _add_learner = Event::AddLearner(4);
 let _msg = Event::Message(Message::RequestVote(RequestVote {
-    term: 1, candidate: 2, last_log_index: 0, last_log_term: 0,
+    term: 1, candidate: 2, last_log_index: 0, last_log_term: 0, force: false,
 }));
 ```
 
@@ -766,6 +794,20 @@ pub struct InstallSnapshotReply {
 A follower's acknowledgement. `last_index` is the snapshot index the follower has
 installed, which the leader uses to advance that follower's replication progress.
 
+#### `TimeoutNow`
+
+```rust
+pub struct TimeoutNow {
+    pub term: Term,
+    pub leader: NodeId,
+}
+```
+
+A leader's signal during a [leadership transfer](#event) telling the target to
+campaign **immediately** rather than wait out its election timeout. The recipient
+starts a forced election (one that bypasses leader stickiness), taking over with
+minimal disruption. `leader` is the node handing off.
+
 #### `ReadProbe`
 
 ```rust
@@ -931,10 +973,10 @@ assert_eq!(recovered.last_index(), node.log().last_index());
 # Ok::<(), raft_io::Error>(())
 ```
 
-Truncated entries remain physically in the WAL until log compaction (snapshots,
-`v0.5`); replay still reconstructs the correct logical state. The byte-record
-API of `wal-db` is used directly — `raft-io` frames its own records and does not
-enable `wal-db`'s `pack-io` feature.
+Truncated entries remain physically in the WAL until log compaction (snapshots);
+replay still reconstructs the correct logical state. The byte-record API of
+`wal-db` is used directly — `raft-io` frames its own records and does not enable
+`wal-db`'s `pack-io` feature.
 
 ---
 
@@ -1046,7 +1088,7 @@ derive `pack_io::Serialize` / `Deserialize` under the feature.
 use raft_io::{framing, Message, RequestVote};
 
 let msg = Message::RequestVote(RequestVote {
-    term: 4, candidate: 2, last_log_index: 9, last_log_term: 3,
+    term: 4, candidate: 2, last_log_index: 9, last_log_term: 3, force: false,
 });
 let bytes = framing::encode(&msg).unwrap();
 assert_eq!(framing::decode(&bytes).unwrap(), msg);

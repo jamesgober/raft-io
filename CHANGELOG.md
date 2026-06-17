@@ -19,6 +19,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.0.0] - 2026-06-08
+
+**Stable.** The protocol is complete and the public API, wire format, and durable
+log format are frozen — no backward-incompatible change before `2.0`. This release
+is the 1.0 polish: documentation, examples, and the final specification pass. No
+behavioural change from `0.10.1`.
+
+### Added
+
+- `examples/learner.rs` — a runnable demonstration of adding a non-voting learner,
+  catching it up while the voter quorum is unchanged, and promoting it to a voter.
+
+### Changed
+
+- All documentation finalized for `1.0`: the API reference
+  ([`docs/API.md`](docs/API.md)) covers every public item, the protocol
+  specification ([`docs/PROTOCOL.md`](docs/PROTOCOL.md)) is declared the `1.0`
+  contract, and version-progression notes ("added in v0.x") have been removed
+  throughout in favour of the stable, complete description.
+
+### Fixed
+
+- Two examples in `docs/API.md` constructed `RequestVote` without its `force`
+  field (it predated the field); corrected so every documented example is valid.
+
+---
+
 ## [0.10.1] - 2026-06-08
 
 Release-candidate hardening: performance baselines and an extended soak. No
@@ -398,7 +425,8 @@ Initial scaffold and repository bootstrap. No raft-io logic yet &mdash; this rel
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/jamesgober/raft-io/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/jamesgober/raft-io/compare/v0.10.1...v1.0.0
 [0.10.1]: https://github.com/jamesgober/raft-io/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/jamesgober/raft-io/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/jamesgober/raft-io/compare/v0.8.0...v0.9.0

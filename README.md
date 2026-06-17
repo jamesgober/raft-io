@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Deterministic sans-I/O core. Pluggable transport + log store. Provable safety properties.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> The wire protocol and trait seams are being designed and frozen across the 0.x series; <code>1.0.0</code> freezes the protocol and the public traits. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: <code>1.0</code> &mdash; stable.</strong> The protocol is complete; the public API, the wire format, and the durable log format are frozen and will not change incompatibly before <code>2.0</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -41,15 +41,16 @@
 
 <h2>What it does</h2>
 
-- **Leader election** &mdash; randomized-timeout election with term and vote safety; one leader per term _(live)_
-- **Log replication** &mdash; batched append-entries with per-follower progress, optimistic pipelining, conflict-hint backtracking, and commit on a quorum _(live in v0.3)_
-- **Deterministic core** &mdash; the state machine is pure and step-driven, so the whole protocol is testable without time or I/O _(live)_
-- **Pluggable transport** &mdash; `RaftTransport` trait; in-memory for tests, real net for production _(live)_
-- **Pluggable log store** &mdash; `RaftLog` trait; `wal-db`-backed `WalLog` under the `persistence` feature _(live in v0.4)_
-- **Crash recovery** &mdash; term, vote, and log persisted before each RPC; a restarted node recovers and rejoins without violating safety _(live in v0.4)_
-- **Snapshotting** &mdash; install-snapshot for log compaction and fast follower catch-up, driven by a snapshot-policy hint _(live in v0.5)_
-- **Typed framing** &mdash; `pack-io` wire encoding for messages under the `framing` feature _(live in v0.5)_
-- **Membership changes** &mdash; single-server add/remove with safe sequencing, plus leadership transfer _(live in v0.6)_
+- **Leader election** &mdash; randomized-timeout election with term and vote safety and pre-vote disruption protection; one leader per term
+- **Log replication** &mdash; batched append-entries with per-follower progress, optimistic pipelining, conflict-hint backtracking, and commit on a quorum
+- **Deterministic core** &mdash; the state machine is pure and step-driven, so the whole protocol is testable without time or I/O
+- **Pluggable transport** &mdash; `RaftTransport` trait; in-memory for tests, real net for production
+- **Pluggable log store** &mdash; `RaftLog` trait; `wal-db`-backed `WalLog` under the `persistence` feature
+- **Crash recovery** &mdash; term, vote, and log persisted before each RPC; a restarted node recovers and rejoins without violating safety
+- **Snapshotting** &mdash; install-snapshot for log compaction and fast follower catch-up, driven by a snapshot-policy hint
+- **Typed framing** &mdash; `pack-io` wire encoding for messages under the `framing` feature
+- **Membership changes** &mdash; single-server add/remove with safe sequencing, non-voting learners with promotion, and leadership transfer
+- **Linearizable reads** &mdash; ReadIndex reads that reflect every committed write, confirmed against a quorum, with no log append
 
 
 <br>
@@ -58,11 +59,11 @@
 
 ```toml
 [dependencies]
-raft-io = "0.10"
+raft-io = "1.0"
 
 # Optional features:
-raft-io = { version = "0.10", features = ["persistence"] } # durable wal-db-backed `WalLog`
-raft-io = { version = "0.10", features = ["framing"] }     # pack-io wire framing for messages
+raft-io = { version = "1.0", features = ["persistence"] } # durable wal-db-backed `WalLog`
+raft-io = { version = "1.0", features = ["framing"] }     # pack-io wire framing for messages
 ```
 
 <br>
@@ -111,7 +112,8 @@ cargo run --example replicated_log      # propose + replicate; all nodes agree
 cargo run --example partition_recovery  # minority stalls, majority commits, heal
 cargo run --example snapshot_catchup    # leader compacts; lagging node catches up via snapshot
 cargo run --example membership          # add a node, remove a node, transfer leadership
-cargo run --example kv_store            # a replicated key-value store, end to end
+cargo run --example learner             # add a non-voting learner, catch it up, promote it
+cargo run --example kv_store            # a replicated key-value store with linearizable reads
 cargo run --example persistent_node --features persistence  # log survives a restart
 ```
 
@@ -119,27 +121,21 @@ cargo run --example persistent_node --features persistence  # log survives a res
 
 ## Status
 
-This is `v0.10.0`: **beta — feature complete, hardened, soaking toward 1.0.** The
-full protocol — election (with pre-vote disruption protection), replication, durable
-crash recovery, snapshots, membership changes with non-voting **learners**,
-leadership transfer, and **linearizable reads** (the ReadIndex protocol) — is in
-place. A kitchen-sink adversarial test suite drives clusters through combined
-partitions, message loss/reorder/duplication, membership churn, and snapshotting, and
-asserts all five Raft safety properties (Election Safety, Leader Append-Only, Log
-Matching, Leader Completeness, State Machine Safety) continuously over sustained
-runs; a companion suite drives a replicated key-value store to identical state on
-every node — and serves stale-free linearizable reads — under the same faults; and
-the decode path is fuzzed. The public traits and the wire and WAL formats are
-**frozen** — see the normative
-<a href="./docs/PROTOCOL.md"><code>docs/PROTOCOL.md</code></a>; additions in the 0.x
-line stay MINOR-compatible (the pre-vote and read-probe messages are new
-<code>#[non_exhaustive]</code> enum variants, and the learner encoding is
-byte-identical to earlier versions when no learners are used). Committed
-performance baselines for the hot path live in
-<a href="./docs/BENCHMARKS.md"><code>docs/BENCHMARKS.md</code></a>; a final docs and
-spec pass is all that remains before the `1.0` freeze, per the
-<a href="./.dev/ROADMAP.md"><code>ROADMAP</code></a> (development copy). The full
-public surface is documented in <a href="./docs/API.md"><code>docs/API.md</code></a>.
+`1.0` &mdash; **stable.** The protocol is complete: election (with pre-vote
+disruption protection), log replication, durable crash recovery, snapshots,
+single-server membership changes with non-voting **learners**, leadership transfer,
+and **linearizable reads** (the ReadIndex protocol). A kitchen-sink adversarial test
+suite drives clusters through combined partitions, message loss/reorder/duplication,
+membership churn, and snapshotting, and asserts all five Raft safety properties
+(Election Safety, Leader Append-Only, Log Matching, Leader Completeness, State
+Machine Safety) continuously over sustained runs; a companion suite drives a
+replicated key-value store to identical state on every node — and serves stale-free
+linearizable reads — under the same faults; and the decode path is fuzzed. The public
+API, the wire format, and the durable log format are **frozen** and will not change
+incompatibly before `2.0` — see the normative
+<a href="./docs/PROTOCOL.md"><code>docs/PROTOCOL.md</code></a>. The full public
+surface is documented in <a href="./docs/API.md"><code>docs/API.md</code></a>, with
+performance baselines in <a href="./docs/BENCHMARKS.md"><code>docs/BENCHMARKS.md</code></a>.
 
 <hr>
 <br>

@@ -65,9 +65,17 @@ fn main() {
     }
 
     // The node resumes normally: it re-elects (in a higher term) and commits more.
+    // On winning, a leader appends a no-op entry of its new term to establish an
+    // accurate commit index (it inherited an uncommitted tail across the restart),
+    // so that no-op takes index 3 and the next proposal lands at index 4. The
+    // no-op is internal bookkeeping and is never applied to the state machine.
     drive_to_leader(&mut node);
     println!("\nrun 2: leader again in term {}", node.term());
     propose(&mut node, "set z = 3");
     println!("run 2: committed up to index {}", node.commit_index());
-    assert_eq!(node.commit_index(), 3);
+    assert_eq!(
+        node.commit_index(),
+        4,
+        "two recovered entries + a no-op + one new"
+    );
 }

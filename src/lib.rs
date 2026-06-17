@@ -14,22 +14,21 @@
 //!
 //! ## Status
 //!
-//! This is `v0.10`: **beta — feature complete, hardened, soaking toward 1.0.** The
-//! full protocol — election (with [pre-vote] disruption protection), replication,
-//! durable crash recovery (`persistence`), snapshots, membership changes with
-//! non-voting [learners] ([`Event::AddLearner`] / [`Event::PromoteLearner`]),
-//! leadership transfer, and **linearizable reads** ([`Event::Read`] →
-//! [`Action::ReadReady`], the ReadIndex protocol) — is in place and verified by a
-//! kitchen-sink adversarial test suite that asserts all five Raft safety
-//! properties under combined partitions, message loss/reorder/duplication,
-//! membership churn, and snapshotting, plus an application-level suite that drives
-//! a replicated key-value store to convergence — and serves linearizable reads —
-//! under the same faults. The public traits and the wire and WAL formats are
-//! frozen (see `docs/PROTOCOL.md`); the decode path is fuzzed. Additions in this
-//! line stay MINOR-compatible — the pre-vote and read-probe messages are new
-//! `#[non_exhaustive]` enum variants, and the learner encoding is byte-identical
-//! to earlier versions for any cluster that uses no learners. See `docs/API.md`
-//! for the full surface.
+//! **Stable (`1.0`).** The protocol is complete: leader election with
+//! [pre-vote] disruption protection, log replication, durable crash recovery
+//! (the `persistence` feature), snapshots with log compaction, single-server
+//! membership changes with non-voting [learners]
+//! ([`Event::AddLearner`] / [`Event::PromoteLearner`]), leadership transfer, and
+//! **linearizable reads** ([`Event::Read`] → [`Action::ReadReady`], the ReadIndex
+//! protocol). All five Raft safety properties are asserted continuously by a
+//! kitchen-sink adversarial test suite under combined partitions, message
+//! loss/reorder/duplication, membership churn, and snapshotting; an
+//! application-level suite drives a replicated key-value store to convergence —
+//! and serves stale-free linearizable reads — under the same faults; and the
+//! decode path is fuzzed. The public API, the wire format, and the durable log
+//! format are **frozen** and will not change incompatibly before `2.0` (see the
+//! normative `docs/PROTOCOL.md`). The full surface is documented in
+//! `docs/API.md`, with performance baselines in `docs/BENCHMARKS.md`.
 //!
 //! [pre-vote]: PreVote
 //! [learners]: RaftNode::learners

@@ -1,17 +1,14 @@
 //! The RPC messages nodes exchange.
 //!
-//! Raft defines two RPCs. [`RequestVote`] drives elections; [`AppendEntries`]
-//! replicates the log and doubles as the leader's heartbeat. Each has a reply.
-//! The protocol core never sends these itself — it emits
+//! [`RequestVote`] and its [pre-vote](PreVote) variant drive elections;
+//! [`AppendEntries`] replicates the log and doubles as the leader's heartbeat;
+//! [`InstallSnapshot`] catches up a far-behind follower; [`TimeoutNow`] hands off
+//! leadership; and [`ReadProbe`] confirms leadership for a linearizable read.
+//! Each has a reply. The protocol core never sends these itself — it emits
 //! [`Action::Send`](crate::Action::Send) carrying a [`Message`], and the caller
 //! delivers it through a [`RaftTransport`](crate::RaftTransport). Keeping the
-//! messages as plain data is what lets a test harness route them in memory and,
-//! later, a framing layer put them on a wire.
-//!
-//! In `v0.2`, [`AppendEntries`] is used only as an empty heartbeat that keeps a
-//! follower from starting a needless election. Carrying real entries — the
-//! replication pipeline — arrives in `v0.3`; the fields are already present so
-//! the wire shape does not change underneath callers.
+//! messages as plain data is what lets a test harness route them in memory and a
+//! framing layer put them on a wire.
 
 use crate::types::{Index, LogEntry, NodeId, Snapshot, Term};
 
@@ -147,7 +144,7 @@ pub struct RequestVoteReply {
 /// The leader sends this to each follower. With an empty
 /// [`entries`](AppendEntries::entries) list it is a pure heartbeat that asserts
 /// leadership and resets the follower's election timer; with entries it
-/// replicates the log (from `v0.3`). The `prev_log_index` / `prev_log_term`
+/// replicates the log. The `prev_log_index` / `prev_log_term`
 /// pair lets the follower verify its log matches the leader's up to that point
 /// before accepting anything new.
 ///
@@ -178,7 +175,7 @@ pub struct AppendEntries {
     pub prev_log_index: Index,
     /// Term of the entry at `prev_log_index`.
     pub prev_log_term: Term,
-    /// Entries to store (empty for a heartbeat). Replication uses this in `v0.3`.
+    /// Entries to store, in order; empty for a pure heartbeat.
     pub entries: Vec<LogEntry>,
     /// The leader's commit index, so followers can advance their own.
     pub leader_commit: Index,
