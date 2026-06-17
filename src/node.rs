@@ -14,7 +14,7 @@
 //! [pre-vote](crate::PreVote) disruption protection, the full replication
 //! pipeline (batched `AppendEntries`, per-follower progress with optimistic
 //! pipelining, conflict-hint backtracking, commit on a quorum), durable
-//! persistence and crash recovery (the [`WalLog`](crate::WalLog)), snapshots with
+//! persistence and crash recovery (the `WalLog`), snapshots with
 //! log compaction, single-server membership changes with non-voting learners,
 //! leadership transfer, and linearizable reads via the ReadIndex protocol.
 //!
@@ -393,8 +393,8 @@ impl<L: RaftLog> RaftNode<L> {
     /// Creates a node from `config` backed by a caller-supplied `log`.
     ///
     /// This is the Tier-3 entry point: provide any [`RaftLog`] implementation —
-    /// for example a durable, `wal-db`-backed store ([`WalLog`](crate::WalLog),
-    /// under the `persistence` feature). The node adopts
+    /// for example a durable, `wal-db`-backed store (`WalLog`, under the
+    /// `persistence` feature). The node adopts
     /// the log's persisted [`HardState`](crate::HardState) on construction, so a
     /// store recovered from disk resumes in the term it last persisted and with
     /// the vote it last cast.

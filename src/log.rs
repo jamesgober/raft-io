@@ -6,8 +6,8 @@
 //! `Ok` from [`sync`](RaftLog::sync) as the durability point: everything
 //! written before a successful `sync` will survive a crash. That contract is
 //! what lets the same protocol run over a throwaway [`MemoryLog`] in tests and a
-//! `wal-db`-backed store ([`WalLog`](crate::WalLog), under the `persistence`
-//! feature) in production without the core knowing the difference.
+//! `wal-db`-backed store (`WalLog`, under the `persistence` feature) in
+//! production without the core knowing the difference.
 //!
 //! Implementors map their own failures into [`Error::Storage`] via
 //! [`Error::storage`](crate::Error::storage), so the trait's error type stays

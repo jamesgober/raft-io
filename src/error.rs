@@ -61,7 +61,7 @@ pub enum Error {
     /// A [`RaftLog`](crate::RaftLog) backend operation failed.
     ///
     /// The in-memory log never produces this, but a durable backend (the
-    /// `wal-db`-backed [`WalLog`](crate::WalLog)) can fail to read, append, or
+    /// `wal-db`-backed `WalLog`) can fail to read, append, or
     /// flush. `context` names the operation that was attempted (for example
     /// `"append entries"` or `"sync log"`) so the message is actionable, and
     /// `detail` carries the backend's own description. The caller should treat
