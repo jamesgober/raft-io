@@ -18,12 +18,13 @@
 
 > Complete reference for every public item in `raft-io`, with examples.
 >
-> **Status: pre-1.0 (`v0.9`, beta — feature complete, soaking toward 1.0).** The
+> **Status: pre-1.0 (`v0.10`, beta — feature complete, soaking toward 1.0).** The
 > public traits and the wire and WAL formats are frozen as of v0.7 (see
 > [`PROTOCOL.md`](./PROTOCOL.md)); additions before `1.0` remain
-> backward-compatible — the v0.8 pre-vote and v0.9 read-probe messages, for
-> instance, are new `#[non_exhaustive]` enum variants that change no existing
-> encoding. This document is the reference for every public item.
+> backward-compatible — the v0.8 pre-vote and v0.9 read-probe messages are new
+> `#[non_exhaustive]` enum variants, and the v0.10 learner configuration encoding
+> is byte-identical to before when no learners are used. This document is the
+> reference for every public item.
 
 ## Table of Contents
 
@@ -75,11 +76,11 @@ leadership ([`Event::TransferLeadership`](#event)). The `framing` feature adds
 
 ```toml
 [dependencies]
-raft-io = "0.9"
+raft-io = "0.10"
 
 # Optional features:
-raft-io = { version = "0.9", features = ["persistence"] } # durable wal-db-backed `WalLog`
-raft-io = { version = "0.9", features = ["framing"] }     # pack-io wire framing for messages
+raft-io = { version = "0.10", features = ["persistence"] } # durable wal-db-backed `WalLog`
+raft-io = { version = "0.10", features = ["framing"] }     # pack-io wire framing for messages
 ```
 
 MSRV: Rust 1.85 (edition 2024).
@@ -363,6 +364,7 @@ to name it.
 | `commit_index` | `Index` | Highest log index known committed. |
 | `last_applied` | `Index` | Highest log index applied. |
 | `members` | `&[NodeId]` | The current voting membership of the cluster. |
+| `learners` | `&[NodeId]` | The current non-voting [learners](#learners) (empty when none). |
 | `log` | `&L` | Shared reference to the underlying log. |
 
 #### `step`
@@ -452,6 +454,8 @@ pub enum Event {
     Snapshot { index: Index, data: Vec<u8> },
     AddServer(NodeId),
     RemoveServer(NodeId),
+    AddLearner(NodeId),
+    PromoteLearner(NodeId),
     TransferLeadership(NodeId),
     Read { id: u64 },
 }
@@ -467,12 +471,18 @@ The input to [`step`](#step). A node only changes state in response to an event:
   hint: the application has serialized its state through `index` into `data`. The
   node compacts the log up to `index`. A snapshot for an uncommitted or stale
   index is ignored.
-- **`AddServer(NodeId)`** / **`RemoveServer(NodeId)`** — add or remove a voting
-  server (leader only; [`Error::NotLeader`](#error) elsewhere). One change at a
-  time: a request while a previous one is uncommitted returns
-  [`Error::ConfigInProgress`](#error). The change takes effect immediately on the
-  leader, before it commits. Removing the leader makes it step down once the
+- **`AddServer(NodeId)`** / **`RemoveServer(NodeId)`** — add a voting server, or
+  remove a server (voter or learner) (leader only; [`Error::NotLeader`](#error)
+  elsewhere). One change at a time: a request while a previous one is uncommitted
+  returns [`Error::ConfigInProgress`](#error). The change takes effect immediately
+  on the leader, before it commits. Removing the leader makes it step down once the
   change commits.
+- **`AddLearner(NodeId)`** / **`PromoteLearner(NodeId)`** — add a non-voting
+  [learner](#learners), or promote an existing learner to a voter (leader only,
+  same one-at-a-time rule). A learner replicates and catches up but counts toward
+  no quorum, so adding a far-behind node never weakens availability; promote it
+  once it has caught up. `AddLearner` is a no-op for an existing voter;
+  `PromoteLearner` is a no-op for an id that is not a current learner.
 - **`TransferLeadership(NodeId)`** — ask the leader to hand off to a voter `target`:
   it catches the target up, then signals it to campaign at once. A no-op on a
   non-leader or for a non-voting target.
@@ -549,6 +559,25 @@ for action in node.step(Event::Propose(b"x".to_vec())).unwrap() {
     }
 }
 ```
+
+---
+
+### Learners
+
+A **learner** is a non-voting member: the leader replicates the log to it and it
+applies committed entries like a follower, but it counts toward **no** quorum —
+commit, election, or read confirmation — until it is promoted. Adding a far-behind
+node as a learner therefore never weakens availability while it catches up; once it
+has caught up, promoting it to a voter is safe.
+
+- Add one with [`Event::AddLearner`](#event); promote it with
+  [`Event::PromoteLearner`](#event); remove it (like any member) with
+  [`Event::RemoveServer`](#event).
+- Query the set with `learners()`; [`members()`](#raftnode) reports only voters.
+- A node that is itself only a learner follows quietly and never campaigns.
+- The configuration encoding is byte-identical to a voters-only cluster unless a
+  learner is present (see [`PROTOCOL.md`](./PROTOCOL.md) §3.2 / §6.1), so existing
+  logs and snapshots are unaffected.
 
 ---
 

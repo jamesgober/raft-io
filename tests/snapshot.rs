@@ -84,9 +84,12 @@ impl Cluster {
             match action {
                 Action::Send { to, message } => self.wire.push((from, to, message)),
                 Action::Apply { index, command, .. } => {
-                    assert_eq!(
-                        index,
-                        self.applied_through[i] + 1,
+                    // Applied indices increase strictly but need not be
+                    // contiguous: configuration entries (including the no-op a
+                    // leader appends on election) advance the index without an
+                    // `Apply`.
+                    assert!(
+                        index > self.applied_through[i],
                         "node {from} applied index {index} out of order (through {})",
                         self.applied_through[i]
                     );

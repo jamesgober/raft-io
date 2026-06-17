@@ -164,6 +164,39 @@ impl LogEntry {
         }
     }
 
+    /// Creates a [`Config`](EntryKind::Config) entry carrying both the voting
+    /// membership `voters` and the non-voting `learners` (replicas that receive
+    /// the log but do not count toward any quorum until promoted).
+    ///
+    /// When `learners` is empty the encoding is byte-for-byte identical to
+    /// [`config`](LogEntry::config), so a cluster that uses no learners produces
+    /// exactly the entries earlier versions did.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use raft_io::LogEntry;
+    ///
+    /// let e = LogEntry::config_with_learners(3, 9, &[1, 2, 3], &[4]);
+    /// assert_eq!(e.members(), Some(vec![1, 2, 3]));
+    /// assert_eq!(e.learners(), Some(vec![4]));
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn config_with_learners(
+        term: Term,
+        index: Index,
+        voters: &[NodeId],
+        learners: &[NodeId],
+    ) -> Self {
+        Self {
+            term,
+            index,
+            kind: EntryKind::Config,
+            command: encode_config(voters, learners),
+        }
+    }
+
     /// Returns the voting membership a [`Config`](EntryKind::Config) entry
     /// carries, or `None` for a [`Normal`](EntryKind::Normal) entry.
     ///
@@ -179,8 +212,87 @@ impl LogEntry {
     pub fn members(&self) -> Option<Vec<NodeId>> {
         match self.kind {
             EntryKind::Normal => None,
-            EntryKind::Config => Some(decode_members(&self.command)),
+            EntryKind::Config => Some(decode_config(&self.command).0),
         }
+    }
+
+    /// Returns the non-voting learners a [`Config`](EntryKind::Config) entry
+    /// carries (empty if it predates learners), or `None` for a
+    /// [`Normal`](EntryKind::Normal) entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use raft_io::LogEntry;
+    ///
+    /// assert_eq!(LogEntry::config(1, 2, &[1, 2]).learners(), Some(vec![]));
+    /// assert_eq!(
+    ///     LogEntry::config_with_learners(1, 2, &[1, 2], &[3]).learners(),
+    ///     Some(vec![3])
+    /// );
+    /// ```
+    #[must_use]
+    pub fn learners(&self) -> Option<Vec<NodeId>> {
+        match self.kind {
+            EntryKind::Normal => None,
+            EntryKind::Config => Some(decode_config(&self.command).1),
+        }
+    }
+}
+
+/// Reserved node id marking the boundary between voters and learners in a
+/// configuration encoding. `u64::MAX` is not a usable node id.
+pub(crate) const CONFIG_SENTINEL: NodeId = u64::MAX;
+
+/// Encodes a configuration — voting `voters` and non-voting `learners` — as
+/// little-endian `u64`s. With no learners the result is exactly
+/// [`encode_members`]`(voters)`, so learner-free clusters are byte-compatible
+/// with versions that predate learners. Otherwise the learners follow a
+/// [`CONFIG_SENTINEL`] separator.
+#[must_use]
+pub(crate) fn encode_config(voters: &[NodeId], learners: &[NodeId]) -> Vec<u8> {
+    if learners.is_empty() {
+        return encode_members(voters);
+    }
+    let mut buf = encode_members(voters);
+    buf.extend_from_slice(&CONFIG_SENTINEL.to_le_bytes());
+    buf.extend_from_slice(&encode_members(learners));
+    buf
+}
+
+/// Decodes a configuration written by [`encode_config`] into `(voters,
+/// learners)`. Bytes without a separator (the pre-learner format) decode to all
+/// voters and no learners.
+#[must_use]
+pub(crate) fn decode_config(bytes: &[u8]) -> (Vec<NodeId>, Vec<NodeId>) {
+    let all = decode_members(bytes);
+    match all.iter().position(|&id| id == CONFIG_SENTINEL) {
+        Some(pos) => (all[..pos].to_vec(), all[pos + 1..].to_vec()),
+        None => (all, Vec::new()),
+    }
+}
+
+/// Encodes a configuration into a single `NodeId` vector (for a
+/// [`Snapshot`]'s `config`), using the same [`CONFIG_SENTINEL`] convention as
+/// [`encode_config`]. Learner-free configurations are just the voter vector.
+#[must_use]
+pub(crate) fn encode_config_vec(voters: &[NodeId], learners: &[NodeId]) -> Vec<NodeId> {
+    if learners.is_empty() {
+        return voters.to_vec();
+    }
+    let mut v = voters.to_vec();
+    v.push(CONFIG_SENTINEL);
+    v.extend_from_slice(learners);
+    v
+}
+
+/// Splits a configuration vector written by [`encode_config_vec`] into `(voters,
+/// learners)`.
+#[must_use]
+pub(crate) fn decode_config_vec(config: &[NodeId]) -> (Vec<NodeId>, Vec<NodeId>) {
+    match config.iter().position(|&id| id == CONFIG_SENTINEL) {
+        Some(pos) => (config[..pos].to_vec(), config[pos + 1..].to_vec()),
+        None => (config.to_vec(), Vec::new()),
     }
 }
 
@@ -384,6 +496,36 @@ mod tests {
         let mut bytes = encode_members(&[5, 6]);
         bytes.push(0xFF); // a stray byte from corruption
         assert_eq!(decode_members(&bytes), vec![5, 6]);
+    }
+
+    #[test]
+    fn test_config_codec_round_trips_voters_and_learners() {
+        for (voters, learners) in [
+            (vec![1, 2, 3], vec![]),
+            (vec![1, 2, 3], vec![4]),
+            (vec![1], vec![2, 3, 4]),
+            (vec![], vec![9]),
+        ] {
+            let (v, l) = decode_config(&encode_config(&voters, &learners));
+            assert_eq!(v, voters);
+            assert_eq!(l, learners);
+            let (vv, ll) = decode_config_vec(&encode_config_vec(&voters, &learners));
+            assert_eq!(vv, voters);
+            assert_eq!(ll, learners);
+        }
+    }
+
+    #[test]
+    fn test_learner_free_config_is_byte_compatible_with_members() {
+        // A configuration with no learners must encode exactly as the bare voter
+        // membership did before learners existed.
+        let voters = [1, 2, 3, 7];
+        assert_eq!(encode_config(&voters, &[]), encode_members(&voters));
+        assert_eq!(
+            LogEntry::config(1, 1, &voters).command,
+            encode_members(&voters)
+        );
+        assert_eq!(LogEntry::config(1, 1, &voters).learners(), Some(vec![]));
     }
 
     #[test]

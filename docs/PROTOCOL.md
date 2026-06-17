@@ -92,9 +92,15 @@ machine.
 
 ### 3.2 Configuration encoding
 
-A configuration is the set of voting member ids. It is encoded as the member ids
-in ascending order, each as a little-endian `u64`, concatenated. A decoder MUST
-ignore a trailing partial 8-byte group (only reachable through corruption).
+A configuration is the set of voting member ids and, optionally, a set of
+non-voting **learner** ids (§6.1). It is encoded as the voter ids in ascending
+order, each a little-endian `u64`, concatenated; if learners are present, a
+reserved separator id `u64::MAX` (never a valid node id) follows, then the learner
+ids in ascending order. A configuration with no learners is therefore byte-for-byte
+the encoding used before learners existed. A decoder MUST ignore a trailing partial
+8-byte group (only reachable through corruption) and MUST treat ids after the
+separator as learners. The same convention packs voters and learners into the
+single id list a snapshot records (§5).
 
 ### 3.3 Leader election
 
@@ -246,6 +252,23 @@ majorities always overlap, so two disjoint majorities can never form.
 - Only voting members run an election timer; a non-voter follows but MUST NOT
   campaign.
 
+### 6.1 Learners (non-voting members)
+
+A configuration MAY include **learners** in addition to voters. A learner is a
+member the leader replicates the log to — by `AppendEntries`, and `InstallSnapshot`
+when it is far enough behind — and that applies committed entries like a follower,
+but that counts toward **no** quorum: not commit (§3.6), not an election majority
+(§3.3), and not a read-confirmation quorum (§11). A learner MUST NOT campaign.
+
+Adding a learner therefore does not change the voting majority, so a far-behind
+node can be brought into replication without weakening availability while it
+catches up. A learner is later **promoted** to a voter by a configuration change
+that moves it from the learner set to the voting set; promotion SHOULD wait until
+the learner has caught up so the larger quorum it creates is immediately
+satisfiable. Removing a member drops it from whichever set it is in. Learner
+changes follow the same one-change-at-a-time, adopt-on-append rules as voter
+changes.
+
 ## 7. Leadership transfer
 
 A leader MAY hand off to a voting `target`: it brings the target's log fully up to
@@ -337,7 +360,9 @@ seams are frozen as of v0.7 and will not break before `2.0`; additions remain
 backward-compatible via the `#[non_exhaustive]` enums and tagged encodings. The
 `PreVote` / `PreVoteReply` (v0.8) and `ReadProbe` / `ReadProbeReply` (v0.9)
 messages are such additions: new enum variants that leave every prior message's
-encoding untouched.
+encoding untouched. The learner configuration encoding (v0.10, §3.2) is likewise
+compatible: it is byte-identical to the prior format whenever no learners are
+present, and extends it with a reserved separator only when they are.
 
 ---
 

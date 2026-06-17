@@ -19,6 +19,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.10.0] - 2026-06-08
+
+Beta: non-voting learner members. All additions are MINOR-compatible — no
+existing signature changes, and the configuration encoding is byte-identical to
+v0.9 for any cluster that uses no learners.
+
+### Added
+
+- **Learner (non-voting) members.** A learner receives the replicated log and
+  catches up like a follower but counts toward **no quorum** — commit, election,
+  or read confirmation — until promoted. Adding a far-behind node as a learner
+  therefore never weakens availability while it catches up. New events
+  [`Event::AddLearner`] and [`Event::PromoteLearner`]; [`Event::RemoveServer`] now
+  drops a learner as well as a voter. Query the set with the new
+  [`RaftNode::learners`] accessor; [`RaftNode::members`] continues to report only
+  voters.
+- `LogEntry::config_with_learners` and `LogEntry::learners`, and the learner-aware
+  configuration encoding. With no learners the encoding is byte-for-byte identical
+  to before — a reserved sentinel (`u64::MAX`, never a valid node id) separates
+  voters from learners only when learners are present, so existing logs, snapshots,
+  and clusters are wholly unaffected.
+
+### Changed
+
+- The configuration carried by a snapshot now records learners alongside voters
+  (packed into the existing `config` field via the same sentinel scheme), so a node
+  that catches up from a snapshot recovers the full membership. Snapshots of
+  learner-free clusters are unchanged.
+
+---
+
 ## [0.9.0] - 2026-06-08
 
 Beta: linearizable reads. All additions are MINOR-compatible — no existing
@@ -347,7 +378,8 @@ Initial scaffold and repository bootstrap. No raft-io logic yet &mdash; this rel
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/jamesgober/raft-io/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/jamesgober/raft-io/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/raft-io/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/raft-io/compare/v0.6.0...v0.7.0

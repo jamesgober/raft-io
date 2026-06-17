@@ -46,6 +46,15 @@ fn sorted_members(ids: impl IntoIterator<Item = NodeId>) -> Vec<NodeId> {
     v
 }
 
+/// Returns the `(voters, learners)` a configuration entry carries, or `None` for
+/// an ordinary command entry.
+fn config_sets(entry: &LogEntry) -> Option<(Vec<NodeId>, Vec<NodeId>)> {
+    match (entry.members(), entry.learners()) {
+        (Some(voters), Some(learners)) => Some((voters, learners)),
+        _ => None,
+    }
+}
+
 /// An input handed to [`RaftNode::step`].
 ///
 /// A node only ever changes state in response to an event. There are exactly
@@ -91,11 +100,26 @@ pub enum Event {
     /// made while a previous configuration change is still uncommitted returns
     /// [`Error::ConfigInProgress`]. Adding a server already present is a no-op.
     AddServer(NodeId),
-    /// Remove a voting server from the cluster.
+    /// Remove a server from the cluster, whether a voter or a learner.
     ///
     /// Same rules as [`AddServer`](Event::AddServer). Removing the leader makes
     /// it step down once the change commits.
     RemoveServer(NodeId),
+    /// Add a non-voting **learner** to the cluster.
+    ///
+    /// A learner receives the replicated log and catches up like a follower but
+    /// counts toward no quorum — adding one never weakens availability, however
+    /// far behind it starts. Once it has caught up, promote it to a voter with
+    /// [`PromoteLearner`](Event::PromoteLearner). Leader-only, one change at a
+    /// time (as [`AddServer`](Event::AddServer)); a no-op if `id` is already a
+    /// voter.
+    AddLearner(NodeId),
+    /// Promote an existing learner to a voting member.
+    ///
+    /// Leader-only, one change at a time. A no-op if `id` is not a current
+    /// learner. Promote only once the learner has caught up, so the larger quorum
+    /// it creates is immediately satisfiable.
+    PromoteLearner(NodeId),
     /// Ask the leader to transfer leadership to `target`.
     ///
     /// The leader brings `target` fully up to date, then signals it to start an
@@ -278,10 +302,18 @@ pub struct RaftNode<L: RaftLog = MemoryLog> {
     /// quorum and election logic read from this; it changes as configuration
     /// entries are appended.
     voters: Vec<NodeId>,
-    /// The configuration in effect at the snapshot base (or the bootstrap
+    /// Current non-voting members: replicas the leader feeds the log to, so they
+    /// catch up, but that count toward no quorum (commit, election, or read
+    /// confirmation) until promoted to a voter. A node that is itself only a
+    /// learner follows quietly and never campaigns.
+    learners: Vec<NodeId>,
+    /// The voting configuration in effect at the snapshot base (or the bootstrap
     /// configuration when there is no snapshot). Entries below the base are gone,
     /// so this anchors configuration recovery.
     base_config: Vec<NodeId>,
+    /// The learner set in effect at the snapshot base, recovered alongside
+    /// [`base_config`](Self::base_config).
+    base_learners: Vec<NodeId>,
     /// Index of the configuration entry currently in effect, or `0` when the
     /// configuration comes from `base_config` rather than a live log entry.
     config_index: Index,
@@ -384,22 +416,27 @@ impl<L: RaftLog> RaftNode<L> {
         let base = log.snapshot_index();
 
         // Bootstrap configuration: the snapshot's recorded membership if it has
-        // one, otherwise this node plus its configured peers.
+        // one (voters and learners are packed into its `config`), otherwise this
+        // node plus its configured peers, with no learners.
         let bootstrap = sorted_members(config.peers.iter().copied().chain([config.id]));
-        let base_config = match log.snapshot() {
-            Some(s) if !s.config.is_empty() => s.config,
-            _ => bootstrap,
+        let (base_config, base_learners) = match log.snapshot() {
+            Some(s) if !s.config.is_empty() => crate::types::decode_config_vec(&s.config),
+            _ => (bootstrap, Vec::new()),
         };
         // The effective configuration is the latest config entry in the live log,
-        // or `base_config` if there is none.
+        // or the base configuration if there is none.
         let mut voters = base_config.clone();
+        let mut learners = base_learners.clone();
         let mut config_index = 0;
         let mut i = log.last_index();
         while i > base {
-            if let Some(members) = log.entry(i).and_then(|e| e.members()) {
-                voters = members;
-                config_index = i;
-                break;
+            if let Some(entry) = log.entry(i) {
+                if let Some((v, l)) = config_sets(&entry) {
+                    voters = v;
+                    learners = l;
+                    config_index = i;
+                    break;
+                }
             }
             i -= 1;
         }
@@ -410,7 +447,9 @@ impl<L: RaftLog> RaftNode<L> {
         Self {
             id: config.id,
             voters,
+            learners,
             base_config,
+            base_learners,
             config_index,
             election_timeout_min: config.election_timeout_min,
             election_timeout_max: config.election_timeout_max,
@@ -539,28 +578,56 @@ impl<L: RaftLog> RaftNode<L> {
         &self.voters
     }
 
+    /// Returns the current non-voting members (learners) of the cluster.
+    ///
+    /// Learners receive the replicated log and catch up like followers but count
+    /// toward no quorum until promoted with [`Event::PromoteLearner`]. Add one
+    /// with [`Event::AddLearner`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use raft_io::{RaftConfig, RaftNode};
+    ///
+    /// let node = RaftNode::new(RaftConfig::new(1, [2, 3]));
+    /// assert!(node.learners().is_empty());
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn learners(&self) -> &[NodeId] {
+        &self.learners
+    }
+
     // ---- configuration ---------------------------------------------------
 
     /// The number of votes (or replicas) that form a majority of the current
-    /// voting membership.
+    /// voting membership. Learners are excluded — they never count toward it.
     #[inline]
     fn quorum(&self) -> usize {
         self.voters.len() / 2 + 1
     }
 
-    /// Whether this node is a voting member of the current configuration.
+    /// Whether this node is a voting member of the current configuration. A
+    /// learner (or a removed node) is not, so it never campaigns.
     #[inline]
     fn is_voter(&self) -> bool {
         self.voters.contains(&self.id)
     }
 
-    /// Adopts `voters` as the new configuration (established by the entry at
-    /// `config_index`, or `0` for the base configuration). Rebuilds leader
-    /// progress for the new peer set and emits [`Action::MembershipChanged`] if
-    /// the membership actually changed.
-    fn set_config(&mut self, voters: Vec<NodeId>, config_index: Index, actions: &mut Vec<Action>) {
-        let changed = voters != self.voters;
+    /// Adopts `voters` / `learners` as the new configuration (established by the
+    /// entry at `config_index`, or `0` for the base configuration). Rebuilds
+    /// leader progress for the new replica set and emits
+    /// [`Action::MembershipChanged`] if either set actually changed.
+    fn set_config(
+        &mut self,
+        voters: Vec<NodeId>,
+        learners: Vec<NodeId>,
+        config_index: Index,
+        actions: &mut Vec<Action>,
+    ) {
+        let changed = voters != self.voters || learners != self.learners;
         self.voters = voters;
+        self.learners = learners;
         self.config_index = config_index;
         if self.role == Role::Leader {
             self.rebuild_progress();
@@ -578,27 +645,33 @@ impl<L: RaftLog> RaftNode<L> {
     fn refresh_config(&mut self, actions: &mut Vec<Action>) {
         let base = self.log.snapshot_index();
         let mut voters = self.base_config.clone();
+        let mut learners = self.base_learners.clone();
         let mut config_index = 0;
         let mut i = self.log.last_index();
         while i > base {
-            if let Some(members) = self.log.entry(i).and_then(|e| e.members()) {
-                voters = members;
-                config_index = i;
-                break;
+            if let Some(entry) = self.log.entry(i) {
+                if let Some((v, l)) = config_sets(&entry) {
+                    voters = v;
+                    learners = l;
+                    config_index = i;
+                    break;
+                }
             }
             i -= 1;
         }
-        self.set_config(voters, config_index, actions);
+        self.set_config(voters, learners, config_index, actions);
     }
 
-    /// Rebuilds leader replication progress for the current peer set, preserving
-    /// the match/next/state of peers that remain.
+    /// Rebuilds leader replication progress for the current replica set — voters
+    /// and learners both, since the leader feeds the log to learners too —
+    /// preserving the match/next/state of replicas that remain.
     fn rebuild_progress(&mut self) {
         let next = self.log.last_index() + 1;
         let old = core::mem::take(&mut self.progress);
         self.progress = self
             .voters
             .iter()
+            .chain(self.learners.iter())
             .filter(|&&id| id != self.id)
             .map(|&id| {
                 old.iter()
@@ -656,8 +729,10 @@ impl<L: RaftLog> RaftNode<L> {
             Event::Message(message) => self.handle_message(message),
             Event::Propose(command) => self.propose(command),
             Event::Snapshot { index, data } => self.handle_snapshot_event(index, data),
-            Event::AddServer(id) => self.change_membership(Some(id), None),
-            Event::RemoveServer(id) => self.change_membership(None, Some(id)),
+            Event::AddServer(id) => self.add_server(id),
+            Event::RemoveServer(id) => self.remove_server(id),
+            Event::AddLearner(id) => self.add_learner(id),
+            Event::PromoteLearner(id) => self.promote_learner(id),
             Event::TransferLeadership(target) => self.transfer_leadership(target),
             Event::Read { id } => self.handle_read(id),
         }
@@ -947,7 +1022,8 @@ impl<L: RaftLog> RaftNode<L> {
                 Some(term) if term == self.current_term => {
                     let mut replicas = leader_holds;
                     for p in &self.progress {
-                        if p.match_index >= n {
+                        // Learners replicate but never count toward the quorum.
+                        if self.voters.contains(&p.id) && p.match_index >= n {
                             replicas += 1;
                         }
                     }
@@ -1058,11 +1134,13 @@ impl<L: RaftLog> RaftNode<L> {
         let Some(term) = self.log.term_at(index) else {
             return Ok(Vec::new());
         };
-        // Record the configuration in effect at `index` so a node catching up
-        // from this snapshot — its config entries compacted — still knows the
-        // membership.
-        let config = self.config_at(index);
-        self.base_config = config.clone();
+        // Record the configuration in effect at `index` — voters and learners
+        // both — so a node catching up from this snapshot, its config entries
+        // compacted, still knows the full membership.
+        let (voters, learners) = self.config_at(index);
+        self.base_config = voters.clone();
+        self.base_learners = learners.clone();
+        let config = crate::types::encode_config_vec(&voters, &learners);
         self.log
             .apply_snapshot(&Snapshot::with_config(index, term, config, data))?;
         self.log.sync()?;
@@ -1074,18 +1152,20 @@ impl<L: RaftLog> RaftNode<L> {
         Ok(actions)
     }
 
-    /// Returns the voting membership in effect at `index`: the latest live
+    /// Returns the `(voters, learners)` in effect at `index`: the latest live
     /// configuration entry at or below `index`, or the base configuration.
-    fn config_at(&self, index: Index) -> Vec<NodeId> {
+    fn config_at(&self, index: Index) -> (Vec<NodeId>, Vec<NodeId>) {
         let base = self.log.snapshot_index();
         let mut i = index.min(self.log.last_index());
         while i > base {
-            if let Some(members) = self.log.entry(i).and_then(|e| e.members()) {
-                return members;
+            if let Some(entry) = self.log.entry(i) {
+                if let Some(sets) = config_sets(&entry) {
+                    return sets;
+                }
             }
             i -= 1;
         }
-        self.base_config.clone()
+        (self.base_config.clone(), self.base_learners.clone())
     }
 
     // ---- message handling ------------------------------------------------
@@ -1615,9 +1695,12 @@ impl<L: RaftLog> RaftNode<L> {
         // reordered `InstallSnapshot`.
         if snap_index > self.log.snapshot_index() && snap_index > self.commit_index {
             // Adopt the configuration the snapshot carries before installing it,
-            // so a node catching up this way knows the membership.
+            // so a node catching up this way knows the membership (voters and
+            // learners both).
             if !rpc.snapshot.config.is_empty() {
-                self.base_config = rpc.snapshot.config.clone();
+                let (voters, learners) = crate::types::decode_config_vec(&rpc.snapshot.config);
+                self.base_config = voters;
+                self.base_learners = learners;
             }
             self.log.apply_snapshot(&rpc.snapshot)?;
             self.log.sync()?;
@@ -1725,18 +1808,13 @@ impl<L: RaftLog> RaftNode<L> {
 
     // ---- membership changes ----------------------------------------------
 
-    /// Appends a configuration entry that adds and/or removes a single voter,
-    /// adopting the new membership immediately.
+    /// Appends a configuration entry establishing `voters` / `learners`, adopting
+    /// it immediately. The single shared path behind every membership change.
     ///
     /// One change at a time: a request made while a previous configuration entry
-    /// is still uncommitted is rejected with [`Error::ConfigInProgress`]. A no-op
-    /// change (adding a member already present, removing one absent) succeeds
-    /// without appending anything.
-    fn change_membership(
-        &mut self,
-        add: Option<NodeId>,
-        remove: Option<NodeId>,
-    ) -> Result<Vec<Action>> {
+    /// is still uncommitted is rejected with [`Error::ConfigInProgress`]. A change
+    /// that leaves both sets unchanged is a no-op and appends nothing.
+    fn reconfigure(&mut self, voters: Vec<NodeId>, learners: Vec<NodeId>) -> Result<Vec<Action>> {
         if self.role != Role::Leader || self.transfer_target.is_some() {
             return Err(Error::NotLeader {
                 leader: self.leader_id,
@@ -1747,32 +1825,70 @@ impl<L: RaftLog> RaftNode<L> {
             return Err(Error::ConfigInProgress);
         }
 
-        let mut members = self.voters.clone();
-        if let Some(id) = add {
-            if !members.contains(&id) {
-                members.push(id);
-            }
-        }
-        if let Some(id) = remove {
-            members.retain(|&m| m != id);
-        }
-        let members = sorted_members(members);
-        if members == self.voters {
+        let voters = sorted_members(voters);
+        let learners = sorted_members(learners);
+        if voters == self.voters && learners == self.learners {
             return Ok(Vec::new()); // nothing to do
         }
 
         let index = self.log.last_index() + 1;
-        let entry = LogEntry::config(self.current_term, index, &members);
+        let entry = LogEntry::config_with_learners(self.current_term, index, &voters, &learners);
         self.log.append(core::slice::from_ref(&entry))?;
         self.log.sync()?;
 
         let mut actions = Vec::new();
         // Adopt the new configuration at once (Raft applies a config entry on
         // append, not on commit), rebuilding progress and announcing the change.
-        self.set_config(members, index, &mut actions);
+        self.set_config(voters, learners, index, &mut actions);
         self.replicate_to_all(&mut actions);
         self.advance_commit(&mut actions);
         Ok(actions)
+    }
+
+    /// Adds `id` as a voting member (promoting it out of the learner set if it was
+    /// one). Idempotent for an existing voter.
+    fn add_server(&mut self, id: NodeId) -> Result<Vec<Action>> {
+        let mut voters = self.voters.clone();
+        if !voters.contains(&id) {
+            voters.push(id);
+        }
+        let learners: Vec<NodeId> = self.learners.iter().copied().filter(|&l| l != id).collect();
+        self.reconfigure(voters, learners)
+    }
+
+    /// Removes `id` from the cluster, whether it was a voter or a learner.
+    fn remove_server(&mut self, id: NodeId) -> Result<Vec<Action>> {
+        let voters: Vec<NodeId> = self.voters.iter().copied().filter(|&v| v != id).collect();
+        let learners: Vec<NodeId> = self.learners.iter().copied().filter(|&l| l != id).collect();
+        self.reconfigure(voters, learners)
+    }
+
+    /// Adds `id` as a non-voting learner. A no-op if it is already a voter; the
+    /// learner replicates and catches up without affecting any quorum until it is
+    /// promoted with [`promote_learner`](Self::promote_learner).
+    fn add_learner(&mut self, id: NodeId) -> Result<Vec<Action>> {
+        if self.voters.contains(&id) {
+            // Already a full member — leave it be (but enforce the leader guard).
+            return self.reconfigure(self.voters.clone(), self.learners.clone());
+        }
+        let mut learners = self.learners.clone();
+        if !learners.contains(&id) {
+            learners.push(id);
+        }
+        self.reconfigure(self.voters.clone(), learners)
+    }
+
+    /// Promotes the learner `id` to a voter. A no-op if `id` is not currently a
+    /// learner. Promote only once the learner has caught up (the leader tracks its
+    /// progress) so the promotion does not transiently weaken availability.
+    fn promote_learner(&mut self, id: NodeId) -> Result<Vec<Action>> {
+        if !self.learners.contains(&id) {
+            return self.reconfigure(self.voters.clone(), self.learners.clone());
+        }
+        let mut voters = self.voters.clone();
+        voters.push(id);
+        let learners: Vec<NodeId> = self.learners.iter().copied().filter(|&l| l != id).collect();
+        self.reconfigure(voters, learners)
     }
 
     // ---- leadership transfer ---------------------------------------------
@@ -3013,5 +3129,138 @@ mod tests {
         // Uncommitted tail at election → not yet read-safe.
         let actions = node.step(Event::Read { id: 1 }).unwrap();
         assert_eq!(read_ready(&actions, 1), None);
+    }
+
+    // ---- v0.10 learner (non-voting) members -------------------------------
+
+    /// Acknowledges an index from a voter so the leader can commit it.
+    fn ack(node: &mut RaftNode, from: NodeId, match_index: Index) {
+        let _ = node
+            .step(Event::Message(Message::AppendEntriesReply(
+                AppendEntriesReply {
+                    term: node.term(),
+                    success: true,
+                    from,
+                    match_index,
+                    conflict_index: 0,
+                    conflict_term: 0,
+                },
+            )))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_add_learner_keeps_voters_and_replicates() {
+        let mut node = elect_multi_node_leader(); // leader 1 of {1,2,3}
+        let actions = node.step(Event::AddLearner(4)).unwrap();
+        // The voter set is untouched; the learner is tracked separately.
+        assert_eq!(node.members(), &[1, 2, 3]);
+        assert_eq!(node.learners(), &[4]);
+        assert_eq!(membership_changed(&actions), Some(vec![1, 2, 3]));
+        // The leader replicates to the new learner like any other follower.
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Send {
+                to: 4,
+                message: Message::AppendEntries(_)
+            }
+        )));
+    }
+
+    #[test]
+    fn test_learner_does_not_count_toward_commit_quorum() {
+        // Leader 1 of {1,2,3} with learner 4. A proposal must commit on a voter
+        // majority (1 + one of {2,3}) — the learner's acknowledgement alone, on
+        // top of the leader, is only two of five nodes but is NOT a voter quorum.
+        let mut node = elect_multi_node_leader();
+        let _ = node.step(Event::AddLearner(4)).unwrap();
+        let cfg_idx = node.log().last_index();
+        ack(&mut node, 2, cfg_idx); // commit the config entry
+        let base = node.commit_index();
+
+        let _ = node.step(Event::Propose(b"x".to_vec())).unwrap();
+        let idx = node.log().last_index();
+        // Only the learner acknowledges: no voter quorum, so no new commit.
+        ack(&mut node, 4, idx);
+        assert_eq!(
+            node.commit_index(),
+            base,
+            "a learner must not form a quorum"
+        );
+        // A voter acknowledges: now the entry commits.
+        ack(&mut node, 2, idx);
+        assert_eq!(node.commit_index(), idx);
+    }
+
+    #[test]
+    fn test_promote_learner_to_voter() {
+        let mut node = elect_multi_node_leader();
+        let _ = node.step(Event::AddLearner(4)).unwrap();
+        let cfg_idx = node.log().last_index();
+        ack(&mut node, 2, cfg_idx); // commit the AddLearner config
+        let actions = node.step(Event::PromoteLearner(4)).unwrap();
+        assert_eq!(node.members(), &[1, 2, 3, 4]);
+        assert!(node.learners().is_empty());
+        assert_eq!(membership_changed(&actions), Some(vec![1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn test_promote_unknown_learner_is_noop() {
+        let mut node = elect_multi_node_leader();
+        let actions = node.step(Event::PromoteLearner(9)).unwrap();
+        assert!(actions.is_empty());
+        assert_eq!(node.members(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_remove_server_drops_a_learner() {
+        let mut node = elect_multi_node_leader();
+        let _ = node.step(Event::AddLearner(4)).unwrap();
+        let cfg_idx = node.log().last_index();
+        ack(&mut node, 2, cfg_idx);
+        let _ = node.step(Event::RemoveServer(4)).unwrap();
+        assert!(node.learners().is_empty());
+        assert_eq!(node.members(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_add_learner_rejected_on_follower() {
+        let mut node = RaftNode::new(RaftConfig::new(2, [1, 3]));
+        let err = node.step(Event::AddLearner(4)).unwrap_err();
+        assert!(matches!(err, Error::NotLeader { .. }));
+    }
+
+    #[test]
+    fn test_a_learner_node_never_campaigns() {
+        // A node whose latest configuration lists it as a learner follows quietly
+        // and never starts an election, however long it waits.
+        let mut log = MemoryLog::new();
+        log.append(&[LogEntry::config_with_learners(1, 1, &[1, 2, 3], &[5])])
+            .unwrap();
+        let mut node = RaftNode::with_log(
+            RaftConfig::new(5, [1, 2, 3]).with_election_timeout(2, 2),
+            log,
+        );
+        assert_eq!(node.members(), &[1, 2, 3]);
+        assert_eq!(node.learners(), &[5]);
+        for _ in 0..50 {
+            let _ = node.step(Event::Tick).unwrap();
+        }
+        assert_eq!(node.role(), Role::Follower);
+    }
+
+    #[test]
+    fn test_learner_set_recovered_from_snapshot_config() {
+        let mut log = MemoryLog::new();
+        log.apply_snapshot(&Snapshot::with_config(
+            5,
+            2,
+            crate::types::encode_config_vec(&[1, 2, 3], &[4, 6]),
+            b"s".to_vec(),
+        ))
+        .unwrap();
+        let node = RaftNode::with_log(RaftConfig::single(1), log);
+        assert_eq!(node.members(), &[1, 2, 3]);
+        assert_eq!(node.learners(), &[4, 6]);
     }
 }

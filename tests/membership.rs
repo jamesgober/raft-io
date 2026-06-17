@@ -174,6 +174,118 @@ impl Cluster {
             .map(|i| self.nodes[i].1.members().to_vec())
             .unwrap_or_default()
     }
+
+    fn learners_of(&self, id: NodeId) -> Vec<NodeId> {
+        self.index_of(id)
+            .map(|i| self.nodes[i].1.learners().to_vec())
+            .unwrap_or_default()
+    }
+
+    fn applied_through(&self, id: NodeId) -> u64 {
+        self.applied.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Creates a fresh node `new_id` and asks the leader to add it as a learner.
+    fn add_learner(&mut self, new_id: NodeId) {
+        let mut members: Vec<NodeId> = self.nodes.iter().map(|(i, _)| *i).collect();
+        members.push(new_id);
+        let cfg = RaftConfig::new(new_id, members)
+            .with_election_timeout(60, 80)
+            .with_heartbeat_interval(3)
+            .with_seed(0xB000 + new_id);
+        self.nodes.push((new_id, RaftNode::new(cfg)));
+        if let Some(idx) = self.nodes.iter().position(|(_, n)| n.is_leader()) {
+            let id = self.nodes[idx].0;
+            if let Ok(actions) = self.nodes[idx].1.step(Event::AddLearner(new_id)) {
+                self.absorb(id, actions);
+            }
+        }
+    }
+
+    /// Asks the leader to promote learner `id` to a voter.
+    fn promote(&mut self, id: NodeId) {
+        if let Some(idx) = self.nodes.iter().position(|(_, n)| n.is_leader()) {
+            let from = self.nodes[idx].0;
+            if let Ok(actions) = self.nodes[idx].1.step(Event::PromoteLearner(id)) {
+                self.absorb(from, actions);
+            }
+        }
+    }
+}
+
+/// A learner joins, catches up without ever being a voter (so the quorum never
+/// grows under it), keeps the cluster committing throughout, and is then promoted
+/// — after which it is an ordinary voter and the whole cluster agrees.
+#[test]
+fn learner_catches_up_then_is_promoted() {
+    let mut cluster = Cluster::new(3);
+    cluster.settle(40);
+
+    // Build a backlog the new node will have to catch up on.
+    for _ in 0..20 {
+        cluster.propose();
+        cluster.settle(2);
+    }
+    let leader = cluster.leader().expect("a leader");
+    let committed_before = cluster.applied_through(leader);
+
+    // Add node 3 as a *learner*: the voter set stays {0,1,2}, so the commit
+    // quorum is unchanged while node 3 is far behind.
+    cluster.add_learner(3);
+    cluster.settle(20); // let the configuration entry reach the followers
+    for id in [0, 1, 2] {
+        assert_eq!(
+            cluster.members_of(id),
+            vec![0, 1, 2],
+            "voters changed for {id}"
+        );
+        assert_eq!(
+            cluster.learners_of(id),
+            vec![3],
+            "node {id} missed the learner"
+        );
+    }
+
+    // The cluster keeps committing new proposals while the learner catches up —
+    // adding a far-behind learner never stalls availability.
+    for _ in 0..10 {
+        cluster.propose();
+        cluster.settle(2);
+    }
+    cluster.settle(60);
+    assert!(
+        cluster.applied_through(3) >= committed_before,
+        "the learner did not catch up (applied {}, expected ≥ {committed_before})",
+        cluster.applied_through(3)
+    );
+
+    // Promote the caught-up learner; now it is a full voter everywhere.
+    cluster.promote(3);
+    cluster.settle(80);
+    for id in [0, 1, 2, 3] {
+        assert_eq!(
+            cluster.members_of(id),
+            vec![0, 1, 2, 3],
+            "node {id} missed the promotion"
+        );
+        assert!(
+            cluster.learners_of(id).is_empty(),
+            "node {id} still lists a learner"
+        );
+    }
+
+    // A final proposal commits under the new 4-voter quorum and reaches everyone.
+    cluster.propose();
+    cluster.settle(40);
+    let leader = cluster.leader().expect("a leader");
+    let target = cluster.applied_through(leader);
+    for id in [0, 1, 2, 3] {
+        assert_eq!(
+            cluster.applied_through(id),
+            target,
+            "node {id} diverged after promotion"
+        );
+    }
 }
 
 /// Add a server, then remove a different one, all while the cluster is taking

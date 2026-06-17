@@ -38,6 +38,10 @@ struct Cluster {
     side: Option<Vec<bool>>,
     /// Every command applied by each node, in order, for the apply-ordering check.
     applied: Vec<Vec<Vec<u8>>>,
+    /// Highest log index each node has applied, for the ordering check. Applied
+    /// indices increase strictly but are not contiguous — configuration entries
+    /// (including the election no-op) advance the index without an `Apply`.
+    applied_index: Vec<u64>,
     /// The agreed command at each committed index, for the agreement check.
     committed: BTreeMap<u64, Vec<u8>>,
     /// Monotonic source of distinct proposal payloads.
@@ -63,6 +67,7 @@ impl Cluster {
             wire: Vec::new(),
             side: None,
             applied: vec![Vec::new(); n],
+            applied_index: vec![0; n],
             committed: BTreeMap::new(),
             next_value: 1,
         }
@@ -87,15 +92,15 @@ impl Cluster {
             match action {
                 Action::Send { to, message } => self.wire.push((from, to, message)),
                 Action::Apply { index, command, .. } => {
-                    // Apply ordering: strictly sequential, no gaps.
-                    let log = &mut self.applied[node_idx];
-                    assert_eq!(
-                        index as usize,
-                        log.len() + 1,
-                        "node {from} applied index {index} out of order (had {})",
-                        log.len()
+                    // Apply ordering: strictly increasing indices (configuration
+                    // entries are skipped, so not necessarily contiguous).
+                    assert!(
+                        index > self.applied_index[node_idx],
+                        "node {from} applied index {index} out of order (through {})",
+                        self.applied_index[node_idx]
                     );
-                    log.push(command.clone());
+                    self.applied_index[node_idx] = index;
+                    self.applied[node_idx].push(command.clone());
                     // Agreement: same command at a given committed index everywhere.
                     match self.committed.get(&index) {
                         Some(existing) => assert_eq!(
