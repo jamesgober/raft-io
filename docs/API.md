@@ -18,12 +18,12 @@
 
 > Complete reference for every public item in `raft-io`, with examples.
 >
-> **Status: pre-1.0 (`v0.8`, alpha — feature complete, in consumer integration).**
-> The public traits and the wire and WAL formats are frozen as of v0.7 (see
+> **Status: pre-1.0 (`v0.9`, beta — feature complete, soaking toward 1.0).** The
+> public traits and the wire and WAL formats are frozen as of v0.7 (see
 > [`PROTOCOL.md`](./PROTOCOL.md)); additions before `1.0` remain
-> backward-compatible — the v0.8 pre-vote messages, for instance, are new
-> `#[non_exhaustive]` enum variants that change no existing encoding. This document
-> is the reference for every public item.
+> backward-compatible — the v0.8 pre-vote and v0.9 read-probe messages, for
+> instance, are new `#[non_exhaustive]` enum variants that change no existing
+> encoding. This document is the reference for every public item.
 
 ## Table of Contents
 
@@ -37,7 +37,7 @@
   - [`RaftNode`](#raftnode)
   - [`Event`](#event)
   - [`Action`](#action)
-  - [Messages](#messages) — [`Message`](#message), [`PreVote`](#prevote), [`PreVoteReply`](#prevotereply), [`RequestVote`](#requestvote), [`RequestVoteReply`](#requestvotereply), [`AppendEntries`](#appendentries), [`AppendEntriesReply`](#appendentriesreply), [`InstallSnapshot`](#installsnapshot), [`InstallSnapshotReply`](#installsnapshotreply)
+  - [Messages](#messages) — [`Message`](#message), [`PreVote`](#prevote), [`PreVoteReply`](#prevotereply), [`RequestVote`](#requestvote), [`RequestVoteReply`](#requestvotereply), [`AppendEntries`](#appendentries), [`AppendEntriesReply`](#appendentriesreply), [`InstallSnapshot`](#installsnapshot), [`InstallSnapshotReply`](#installsnapshotreply), [`ReadProbe`](#readprobe), [`ReadProbeReply`](#readprobereply)
   - [`RaftLog`](#raftlog), [`MemoryLog`](#memorylog) & [`WalLog`](#wallog)
   - [`RaftTransport`](#rafttransport) & [`MemoryTransport`](#memorytransport)
   - [`Error`](#error), [`Result`](#result) & [`framing`](#framing)
@@ -75,11 +75,11 @@ leadership ([`Event::TransferLeadership`](#event)). The `framing` feature adds
 
 ```toml
 [dependencies]
-raft-io = "0.8"
+raft-io = "0.9"
 
 # Optional features:
-raft-io = { version = "0.8", features = ["persistence"] } # durable wal-db-backed `WalLog`
-raft-io = { version = "0.8", features = ["framing"] }     # pack-io wire framing for messages
+raft-io = { version = "0.9", features = ["persistence"] } # durable wal-db-backed `WalLog`
+raft-io = { version = "0.9", features = ["framing"] }     # pack-io wire framing for messages
 ```
 
 MSRV: Rust 1.85 (edition 2024).
@@ -453,6 +453,7 @@ pub enum Event {
     AddServer(NodeId),
     RemoveServer(NodeId),
     TransferLeadership(NodeId),
+    Read { id: u64 },
 }
 ```
 
@@ -475,6 +476,12 @@ The input to [`step`](#step). A node only changes state in response to an event:
 - **`TransferLeadership(NodeId)`** — ask the leader to hand off to a voter `target`:
   it catches the target up, then signals it to campaign at once. A no-op on a
   non-leader or for a non-voting target.
+- **`Read { id }`** — request a **linearizable read** tagged with the caller token
+  `id` (leader only; [`Error::NotLeader`](#error) elsewhere). The leader confirms
+  it still leads a quorum and applies through the read point, then emits
+  [`Action::ReadReady`](#action) with the same `id`; the state machine then
+  reflects every command committed before the read. See the ReadIndex protocol in
+  [`PROTOCOL.md`](./PROTOCOL.md) §11.
 
 ```rust
 use raft_io::{Event, Message, RequestVote};
@@ -498,6 +505,7 @@ pub enum Action {
     Snapshot { index: Index, term: Term },
     RestoreSnapshot { index: Index, term: Term, data: Vec<u8> },
     MembershipChanged { members: Vec<NodeId> },
+    ReadReady { id: u64, index: Index },
 }
 ```
 
@@ -518,6 +526,11 @@ What [`step`](#step) returns for the caller to carry out. The node decides
 - **`MembershipChanged { members }`** — the voting membership changed. Update the
   transport so it can reach the new members. Emitted on append of the change,
   before it commits.
+- **`ReadReady { id, index }`** — a [`Event::Read`](#event) tagged `id` is now safe
+  to serve: leadership is confirmed and the state machine is applied through
+  `index`. Read the state machine and answer the client; it reflects every command
+  committed before the read. If leadership is lost before confirmation the read is
+  dropped (no action) and the client should retry against the new leader.
 
 `#[non_exhaustive]`: a `match` must include a wildcard arm.
 
@@ -563,6 +576,8 @@ pub enum Message {
     InstallSnapshot(InstallSnapshot),
     InstallSnapshotReply(InstallSnapshotReply),
     TimeoutNow(TimeoutNow),
+    ReadProbe(ReadProbe),
+    ReadProbeReply(ReadProbeReply),
 }
 ```
 
@@ -719,6 +734,37 @@ pub struct InstallSnapshotReply {
 
 A follower's acknowledgement. `last_index` is the snapshot index the follower has
 installed, which the leader uses to advance that follower's replication progress.
+
+#### `ReadProbe`
+
+```rust
+pub struct ReadProbe {
+    pub term: Term,
+    pub leader: NodeId,
+    pub seq: u64,
+}
+```
+
+A leader's read-confirmation probe, the network half of a linearizable read (the
+ReadIndex protocol). To answer a read without serving stale state, the leader
+confirms it still leads a quorum: it sends `ReadProbe` to every voter and waits for
+matching [`ReadProbeReply`](#readprobereply)s. `seq` is a monotonic round number
+echoed back so the leader knows which round a reply confirms. The probe carries no
+log data and changes no state.
+
+#### `ReadProbeReply`
+
+```rust
+pub struct ReadProbeReply {
+    pub term: Term,
+    pub from: NodeId,
+    pub seq: u64,
+}
+```
+
+A follower's acknowledgement of a [`ReadProbe`](#readprobe), sent iff it still
+recognises the prober as leader. `seq` echoes the probe; if `term` exceeds the
+leader's, the leader has been deposed and steps down rather than counting it.
 
 ```rust
 use raft_io::{AppendEntries, Message};

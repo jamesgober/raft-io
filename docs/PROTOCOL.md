@@ -195,6 +195,8 @@ new state. Honouring the order in which actions are returned is sufficient.
 | `InstallSnapshot { term, leader, snapshot }` | leader → follower | Catch up a far-behind follower (§5). |
 | `InstallSnapshotReply { term, from, last_index }` | follower → leader | Acknowledge the installed index. |
 | `TimeoutNow { term, leader }` | leader → target | Trigger an immediate (forced) election (§7). |
+| `ReadProbe { term, leader, seq }` | leader → voters | Confirm leadership to serve a linearizable read (§12). |
+| `ReadProbeReply { term, from, seq }` | voter → leader | Acknowledge the leader for round `seq`. |
 
 A node that receives any message with a term greater than its own MUST adopt that
 term and revert to follower before handling the message — **except** where leader
@@ -298,11 +300,44 @@ The protocol guarantees, and the test suite verifies under adversarial schedules
 5. **State Machine Safety** — if a node has applied an entry at a given index, no
    node ever applies a different entry at that index.
 
-## 11. Versioning
+## 11. Linearizable reads (ReadIndex, §6.4)
+
+A leader MAY serve a **linearizable read** — one that reflects every entry
+committed before the read was requested — without appending to the log, using the
+ReadIndex protocol:
+
+1. The leader records its current commit index as the read's **read index**.
+2. The leader MUST confirm it still leads a majority before answering: it sends
+   `ReadProbe` (carrying a monotonic round `seq`) to every other voter and waits
+   for `ReadProbeReply`s with that `seq` from a quorum (counting itself). A voter
+   replies iff it still recognises the prober as leader for its term; a probe or
+   reply changes no persistent state. This step is what prevents a leader deposed
+   by a partition it has not yet observed from answering with stale state.
+3. The read is released once both hold: a quorum has confirmed the round, **and**
+   the leader has applied through the read index. The served state then reflects
+   every command committed as of the read index.
+
+A read index is only sound once the leader's commit index reflects everything
+truly committed before it took over. A leader that won election holding an
+uncommitted tail of earlier-term entries cannot establish that by replica count
+alone (§3.6), so on becoming leader it MUST, in that case, append a **no-op entry
+of its own term** and may serve reads only once an entry of its current term has
+committed. raft-io encodes this no-op as a configuration entry re-asserting the
+current membership; like any configuration entry it is never applied to the state
+machine, so **applied indices increase strictly but need not be contiguous**, and
+a consumer keys applied state by each entry's index rather than by counting.
+
+If leadership is lost before a read is confirmed, the read is abandoned and the
+client retries against the new leader.
+
+## 12. Versioning
 
 The crate follows semantic versioning. The formats in §4, §8, and §9 and the trait
 seams are frozen as of v0.7 and will not break before `2.0`; additions remain
-backward-compatible via the `#[non_exhaustive]` enums and tagged encodings.
+backward-compatible via the `#[non_exhaustive]` enums and tagged encodings. The
+`PreVote` / `PreVoteReply` (v0.8) and `ReadProbe` / `ReadProbeReply` (v0.9)
+messages are such additions: new enum variants that leave every prior message's
+encoding untouched.
 
 ---
 

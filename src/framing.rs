@@ -70,7 +70,7 @@ mod tests {
     use super::*;
     use crate::message::{
         AppendEntries, AppendEntriesReply, InstallSnapshot, InstallSnapshotReply, PreVote,
-        PreVoteReply, RequestVote, RequestVoteReply, TimeoutNow,
+        PreVoteReply, ReadProbe, ReadProbeReply, RequestVote, RequestVoteReply, TimeoutNow,
     };
     use crate::types::{LogEntry, Snapshot};
 
@@ -140,6 +140,16 @@ mod tests {
             snapshot: Snapshot::with_config(10, 3, vec![1, 2, 3], b"state".to_vec()),
         }));
         round_trip(Message::TimeoutNow(TimeoutNow { term: 7, leader: 1 }));
+        round_trip(Message::ReadProbe(ReadProbe {
+            term: 7,
+            leader: 1,
+            seq: 42,
+        }));
+        round_trip(Message::ReadProbeReply(ReadProbeReply {
+            term: 7,
+            from: 2,
+            seq: 42,
+        }));
     }
 
     #[test]

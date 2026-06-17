@@ -305,6 +305,62 @@ pub struct TimeoutNow {
     pub leader: NodeId,
 }
 
+/// A leader's read-confirmation probe, the network half of a linearizable read.
+///
+/// To serve a read that reflects every previously-committed write, a leader must
+/// confirm it is *still* the leader at the moment of the read — a deposed leader
+/// that has not yet learned of its fall could otherwise answer with stale state
+/// (the ReadIndex protocol, Raft thesis §6.4). The leader sends `ReadProbe` to
+/// every other voter and waits for a quorum of [`ReadProbeReply`]s carrying the
+/// matching `seq` before releasing the read. The probe carries no log data and
+/// changes no state; it is a pure leadership check.
+///
+/// # Examples
+///
+/// ```
+/// use raft_io::ReadProbe;
+///
+/// let probe = ReadProbe { term: 5, leader: 1, seq: 42 };
+/// assert_eq!(probe.seq, 42);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "framing", derive(pack_io::Serialize, pack_io::Deserialize))]
+pub struct ReadProbe {
+    /// The leader's term.
+    pub term: Term,
+    /// The leader issuing the probe.
+    pub leader: NodeId,
+    /// A monotonic confirmation-round number, echoed back in the reply so the
+    /// leader can tell which round a reply confirms.
+    pub seq: u64,
+}
+
+/// A follower's acknowledgement of a [`ReadProbe`].
+///
+/// A follower replies iff it still recognises the prober as leader for its term.
+/// `seq` echoes the probe so the leader counts replies for the right round; if
+/// `term` exceeds the leader's, the leader has been deposed and steps down rather
+/// than counting the reply.
+///
+/// # Examples
+///
+/// ```
+/// use raft_io::ReadProbeReply;
+///
+/// let reply = ReadProbeReply { term: 5, from: 2, seq: 42 };
+/// assert_eq!(reply.from, 2);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "framing", derive(pack_io::Serialize, pack_io::Deserialize))]
+pub struct ReadProbeReply {
+    /// The responder's current term, for the leader to update itself.
+    pub term: Term,
+    /// The node that produced this reply.
+    pub from: NodeId,
+    /// The probe round this reply confirms (echoed from the [`ReadProbe`]).
+    pub seq: u64,
+}
+
 /// Any message a node can send or receive.
 ///
 /// Wraps the RPCs and their replies. The enum is
@@ -351,6 +407,10 @@ pub enum Message {
     InstallSnapshotReply(InstallSnapshotReply),
     /// A leader is handing off leadership, telling the target to campaign now.
     TimeoutNow(TimeoutNow),
+    /// A leader is confirming its leadership to serve a linearizable read.
+    ReadProbe(ReadProbe),
+    /// A follower is acknowledging a read-confirmation probe.
+    ReadProbeReply(ReadProbeReply),
 }
 
 impl Message {
@@ -388,6 +448,8 @@ impl Message {
             Self::InstallSnapshot(m) => m.term,
             Self::InstallSnapshotReply(m) => m.term,
             Self::TimeoutNow(m) => m.term,
+            Self::ReadProbe(m) => m.term,
+            Self::ReadProbeReply(m) => m.term,
         }
     }
 }

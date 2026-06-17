@@ -95,6 +95,8 @@ struct KvNode {
 struct Cluster {
     nodes: Vec<KvNode>,
     mailboxes: Vec<(NodeId, VecDeque<Message>)>,
+    /// `(node index, read index)` for each linearizable read that became ready.
+    reads_ready: Vec<(usize, u64)>,
 }
 
 impl Cluster {
@@ -112,7 +114,11 @@ impl Cluster {
             })
             .collect();
         let mailboxes = ids.iter().map(|&id| (id, VecDeque::new())).collect();
-        Self { nodes, mailboxes }
+        Self {
+            nodes,
+            mailboxes,
+            reads_ready: Vec::new(),
+        }
     }
 
     fn mailbox(&mut self, id: NodeId) -> Option<&mut VecDeque<Message>> {
@@ -145,9 +151,27 @@ impl Cluster {
                 Action::RestoreSnapshot { data, .. } => {
                     self.nodes[node_idx].store.restore(&data);
                 }
+                Action::ReadReady { index, .. } => self.reads_ready.push((node_idx, index)),
                 _ => {}
             }
         }
+    }
+
+    /// Performs a linearizable read of `key`: asks the leader for a read, settles
+    /// until it is confirmed and applied, then reads the leader's state machine —
+    /// which is guaranteed to reflect every write committed before the request.
+    fn linearizable_read(&mut self, key: &str) -> Option<Option<String>> {
+        let leader = self.leader()?;
+        self.reads_ready.clear();
+        let actions = self.nodes[leader].raft.step(Event::Read { id: 1 }).ok()?;
+        self.absorb(leader, actions);
+        for _ in 0..100 {
+            if let Some(&(idx, _index)) = self.reads_ready.first() {
+                return Some(self.nodes[idx].store.get(key).cloned());
+            }
+            self.step_round();
+        }
+        None
     }
 
     fn step_round(&mut self) {
@@ -226,6 +250,16 @@ fn main() {
             .map(String::as_str)
             .unwrap_or("<none>");
         println!("  node {}: beta={beta}, gamma={gamma}", node.id);
+    }
+
+    // A linearizable read: the leader confirms it still leads a quorum before
+    // answering, so the value reflects every committed write — never stale state
+    // from a leader that has silently lost its mandate.
+    if let Some(value) = cluster.linearizable_read("beta") {
+        println!(
+            "\nlinearizable read of beta: {}",
+            value.as_deref().unwrap_or("<none>")
+        );
     }
 
     // Drive enough writes to cross the snapshot threshold, then add a node that

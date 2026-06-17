@@ -19,6 +19,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.9.0] - 2026-06-08
+
+Beta: linearizable reads. All additions are MINOR-compatible — no existing
+signature, wire encoding, or WAL record changed.
+
+### Added
+
+- **Linearizable reads (the ReadIndex protocol, Raft thesis §6.4).** A new
+  [`Event::Read { id }`] asks the leader for a read; the leader confirms it still
+  leads a quorum and waits until its applied state covers the read point, then
+  emits [`Action::ReadReady { id, index }`]. At that moment the state machine
+  reflects every command committed before the read was requested, so a read never
+  returns stale state from a leader that has silently lost its mandate. Reads are
+  served entirely off the existing log — no entry is appended.
+- New `Message::ReadProbe` / `Message::ReadProbeReply` variants carry the
+  leadership-confirmation round. Like the v0.8 pre-vote messages, these are
+  additive `#[non_exhaustive]` enum variants and leave every existing message
+  encoding unchanged.
+- `examples/kv_store.rs` now demonstrates a linearizable read, and
+  `tests/kv_consumer.rs` asserts that a read on a healed cluster is never stale —
+  its read index always covers everything committed before the request.
+
+### Changed
+
+- On winning an election a leader now appends a **no-op entry of its own term**
+  when it took over with an uncommitted tail, so that committing the no-op carries
+  those earlier-term entries over the commit line and establishes an accurate
+  commit index (required for ReadIndex correctness, Raft thesis §6.4 / §8). The
+  no-op is a configuration entry re-asserting the current membership and is never
+  surfaced to the application. A consequence, shared with ordinary membership
+  entries: applied indices increase strictly but are **not** contiguous — a
+  consumer keys its applied state by the index in each `Action::Apply`, never by
+  counting.
+
+---
+
 ## [0.8.0] - 2026-06-08
 
 Alpha: integration against the library's first real consumer, and the liveness
@@ -311,7 +347,8 @@ Initial scaffold and repository bootstrap. No raft-io logic yet &mdash; this rel
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/raft-io/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jamesgober/raft-io/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/raft-io/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/raft-io/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/raft-io/compare/v0.5.0...v0.6.0

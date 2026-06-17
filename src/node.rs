@@ -32,7 +32,7 @@ use crate::error::{Error, Result};
 use crate::log::{MemoryLog, RaftLog};
 use crate::message::{
     AppendEntries, AppendEntriesReply, InstallSnapshot, InstallSnapshotReply, Message, PreVote,
-    PreVoteReply, RequestVote, RequestVoteReply, TimeoutNow,
+    PreVoteReply, ReadProbe, ReadProbeReply, RequestVote, RequestVoteReply, TimeoutNow,
 };
 use crate::rng::Rng;
 use crate::types::{HardState, Index, LogEntry, NodeId, Role, Snapshot, Term};
@@ -102,6 +102,20 @@ pub enum Event {
     /// election immediately so it takes over with minimal disruption. A no-op on
     /// a non-leader or when `target` is not a voter.
     TransferLeadership(NodeId),
+    /// Request a **linearizable read** identified by the caller's token `id`.
+    ///
+    /// Only a leader may serve one; elsewhere [`step`](RaftNode::step) returns
+    /// [`Error::NotLeader`]. The leader confirms it is still the leader (via a
+    /// quorum of [`ReadProbe`](crate::ReadProbe)s) and waits until its applied
+    /// state covers the read point, then emits [`Action::ReadReady`] carrying the
+    /// same `id`. At that moment the state machine reflects every command
+    /// committed before the read — so the application reads it and answers the
+    /// client. The `id` is opaque to the protocol; use it to match the request to
+    /// its [`ReadReady`](Action::ReadReady).
+    Read {
+        /// A caller-chosen token echoed back in [`Action::ReadReady`].
+        id: u64,
+    },
 }
 
 /// An instruction [`RaftNode::step`] returns for the caller to carry out.
@@ -193,6 +207,20 @@ pub enum Action {
         /// The new voting membership.
         members: Vec<NodeId>,
     },
+    /// A previously requested linearizable read is now safe to serve.
+    ///
+    /// Emitted in response to [`Event::Read`] once the leader has confirmed its
+    /// leadership with a quorum and applied through the read point. The
+    /// application reads its state machine — which now reflects every command
+    /// committed before the read was requested — and answers the client holding
+    /// `id`. If leadership is lost before confirmation the read is dropped (no
+    /// action is emitted); the client should retry against the new leader.
+    ReadReady {
+        /// The caller's token from the originating [`Event::Read`].
+        id: u64,
+        /// The log index the served state is guaranteed to reflect.
+        index: Index,
+    },
 }
 
 /// How a leader is replicating to one follower.
@@ -220,6 +248,9 @@ struct Progress {
     match_index: Index,
     /// Whether we are still probing for the match point or streaming.
     state: ProgressState,
+    /// Highest read-confirmation round (`ReadProbe.seq`) this follower has
+    /// acknowledged, used to count a quorum for linearizable reads.
+    acked_read_seq: u64,
 }
 
 /// A node in a Raft cluster: the deterministic consensus state machine.
@@ -287,6 +318,22 @@ pub struct RaftNode<L: RaftLog = MemoryLog> {
     /// The target of an in-progress leadership transfer, if any. While set, the
     /// leader declines new proposals so the transfer can complete.
     transfer_target: Option<NodeId>,
+
+    /// Whether this leader's commit index is known to reflect every entry
+    /// committed before it took over — true once it has committed an entry of its
+    /// own term (the no-op appended on election, or any later proposal), or once
+    /// it took over already fully caught up. Linearizable reads wait for this so
+    /// they never serve from a commit index that lags the true committed point
+    /// (the ReadIndex correctness condition, Raft thesis §6.4).
+    read_safe: bool,
+    /// Monotonic counter naming the current read-confirmation round.
+    read_seq: u64,
+    /// Reads accepted before [`read_safe`](Self::read_safe), awaiting activation.
+    waiting_reads: Vec<u64>,
+    /// Active reads awaiting a leadership quorum and the apply point: each is
+    /// `(caller id, the round `seq` that confirms it, the read index)`.
+    pending_reads: Vec<(u64, u64, Index)>,
+
     rng: Rng,
 }
 
@@ -386,6 +433,10 @@ impl<L: RaftLog> RaftNode<L> {
             progress: Vec::new(),
             snapshot_hinted_at: base,
             transfer_target: None,
+            read_safe: false,
+            read_seq: 0,
+            waiting_reads: Vec::new(),
+            pending_reads: Vec::new(),
             rng,
         }
     }
@@ -558,6 +609,7 @@ impl<L: RaftLog> RaftNode<L> {
                         next_index: next,
                         match_index: 0,
                         state: ProgressState::Probe,
+                        acked_read_seq: 0,
                     })
             })
             .collect();
@@ -607,6 +659,7 @@ impl<L: RaftLog> RaftNode<L> {
             Event::AddServer(id) => self.change_membership(Some(id), None),
             Event::RemoveServer(id) => self.change_membership(None, Some(id)),
             Event::TransferLeadership(target) => self.transfer_leadership(target),
+            Event::Read { id } => self.handle_read(id),
         }
     }
 
@@ -630,6 +683,11 @@ impl<L: RaftLog> RaftNode<L> {
                 if self.heartbeat_elapsed >= self.heartbeat_interval {
                     self.heartbeat_elapsed = 0;
                     self.replicate_to_all(&mut actions);
+                    // Re-confirm any outstanding reads in case an earlier probe or
+                    // its reply was lost, so a read cannot hang indefinitely.
+                    if !self.pending_reads.is_empty() {
+                        self.send_read_probe(&mut actions);
+                    }
                 }
             }
         }
@@ -697,7 +755,7 @@ impl<L: RaftLog> RaftNode<L> {
         // A single-node cluster (or any cluster where one vote is a majority)
         // wins immediately.
         if self.votes.len() >= self.quorum() {
-            self.become_leader(actions);
+            self.become_leader(actions)?;
             return Ok(());
         }
 
@@ -723,21 +781,46 @@ impl<L: RaftLog> RaftNode<L> {
         Ok(())
     }
 
-    fn become_leader(&mut self, actions: &mut Vec<Action>) {
+    fn become_leader(&mut self, actions: &mut Vec<Action>) -> Result<()> {
         self.role = Role::Leader;
         self.leader_id = Some(self.id);
         self.heartbeat_elapsed = 0;
         self.transfer_target = None;
         self.pre_voting = false;
         self.pre_votes.clear();
+        // Reads are not safe until this leader has committed an entry of its own
+        // term, so it knows its commit index reflects everything truly committed.
+        self.read_safe = false;
+        self.waiting_reads.clear();
+        self.pending_reads.clear();
         // Initialise per-peer progress for the current configuration: each
         // follower is assumed caught up (next = last + 1) and probed to find
         // where it actually is.
         self.rebuild_progress();
+
+        // If the new leader's log is fully committed, its commit index is already
+        // accurate and reads are immediately safe. Otherwise it holds an
+        // uncommitted tail of earlier-term entries it cannot prove committed by
+        // replica count alone (§5.4.2); it appends a no-op of its own term — a
+        // configuration entry re-asserting the current membership, which is never
+        // surfaced to the application — so that committing the no-op rides those
+        // entries over the commit line and establishes an accurate commit index
+        // (the ReadIndex bootstrap, Raft thesis §6.4).
+        if self.commit_index == self.log.last_index() {
+            self.read_safe = true;
+        } else {
+            let index = self.log.last_index() + 1;
+            let entry = LogEntry::config(self.current_term, index, &self.voters);
+            self.log.append(core::slice::from_ref(&entry))?;
+            self.log.sync()?;
+            self.config_index = index;
+        }
+
         // Assert authority at once with an initial round of appends, and
         // (single-node) commit anything outstanding from the current term.
         self.replicate_to_all(actions);
         self.advance_commit(actions);
+        Ok(())
     }
 
     /// Sends an `AppendEntries` to every peer. On a heartbeat tick this both
@@ -883,6 +966,13 @@ impl<L: RaftLog> RaftNode<L> {
         if new_commit > self.commit_index {
             self.commit_index = new_commit;
             self.drain_applies(actions);
+            // Committing an entry of our own term proves the commit index now
+            // reflects everything truly committed, so linearizable reads become
+            // safe and any that arrived early can be activated.
+            if !self.read_safe && self.log.term_at(self.commit_index) == Some(self.current_term) {
+                self.read_safe = true;
+                self.activate_waiting_reads(actions);
+            }
             // A leader that has just committed its own removal steps down.
             if self.role == Role::Leader
                 && !self.is_voter()
@@ -892,6 +982,9 @@ impl<L: RaftLog> RaftNode<L> {
                 self.step_down_to_follower();
             }
         }
+        // Applies above (or a quorum confirmation elsewhere) may have satisfied a
+        // pending read.
+        self.release_ready_reads(actions);
     }
 
     /// Drops leadership without changing term, after committing a configuration
@@ -904,6 +997,9 @@ impl<L: RaftLog> RaftNode<L> {
         self.pre_votes.clear();
         self.progress.clear();
         self.votes.clear();
+        self.read_safe = false;
+        self.waiting_reads.clear();
+        self.pending_reads.clear();
     }
 
     fn drain_applies(&mut self, actions: &mut Vec<Action>) {
@@ -1034,7 +1130,7 @@ impl<L: RaftLog> RaftNode<L> {
 
         match message {
             Message::RequestVote(rv) => self.handle_request_vote(rv, &mut actions)?,
-            Message::RequestVoteReply(reply) => self.handle_vote_reply(reply, &mut actions),
+            Message::RequestVoteReply(reply) => self.handle_vote_reply(reply, &mut actions)?,
             Message::AppendEntries(ae) => self.handle_append_entries(ae, &mut actions)?,
             Message::AppendEntriesReply(reply) => self.handle_append_reply(reply, &mut actions),
             Message::InstallSnapshot(rpc) => self.handle_install_snapshot(rpc, &mut actions)?,
@@ -1042,6 +1138,8 @@ impl<L: RaftLog> RaftNode<L> {
                 self.handle_install_snapshot_reply(reply, &mut actions);
             }
             Message::TimeoutNow(rpc) => self.handle_timeout_now(rpc, &mut actions)?,
+            Message::ReadProbe(rpc) => self.handle_read_probe(rpc, &mut actions),
+            Message::ReadProbeReply(reply) => self.handle_read_probe_reply(reply, &mut actions),
             // Routed above, before the term step-down.
             Message::PreVote(_) | Message::PreVoteReply(_) => {}
         }
@@ -1061,6 +1159,10 @@ impl<L: RaftLog> RaftNode<L> {
         self.pre_votes.clear();
         self.votes.clear();
         self.progress.clear();
+        // Stepping down abandons any reads this node was confirming as leader.
+        self.read_safe = false;
+        self.waiting_reads.clear();
+        self.pending_reads.clear();
         if hard_state_changed {
             self.persist_hard_state()?;
         }
@@ -1102,16 +1204,21 @@ impl<L: RaftLog> RaftNode<L> {
         cand_last_term > my_term || (cand_last_term == my_term && cand_last_index >= my_index)
     }
 
-    fn handle_vote_reply(&mut self, reply: RequestVoteReply, actions: &mut Vec<Action>) {
+    fn handle_vote_reply(
+        &mut self,
+        reply: RequestVoteReply,
+        actions: &mut Vec<Action>,
+    ) -> Result<()> {
         if self.role != Role::Candidate || reply.term != self.current_term {
-            return;
+            return Ok(());
         }
         if reply.vote_granted && !self.votes.contains(&reply.from) {
             self.votes.push(reply.from);
             if self.votes.len() >= self.quorum() {
-                self.become_leader(actions);
+                self.become_leader(actions)?;
             }
         }
+        Ok(())
     }
 
     /// Answers a peer's pre-vote probe. Grants only if we recognise no active
@@ -1160,6 +1267,148 @@ impl<L: RaftLog> RaftNode<L> {
             }
         }
         Ok(())
+    }
+
+    // ---- linearizable reads (ReadIndex, §6.4) ----------------------------
+
+    /// Accepts a linearizable-read request. Only a leader may serve one. The read
+    /// is held until the leader's commit index is known accurate
+    /// ([`read_safe`](Self::read_safe)), a quorum has confirmed leadership, and the
+    /// applied state covers the read point — then [`Action::ReadReady`] is emitted.
+    fn handle_read(&mut self, id: u64) -> Result<Vec<Action>> {
+        if self.role != Role::Leader {
+            return Err(Error::NotLeader {
+                leader: self.leader_id,
+            });
+        }
+        let mut actions = Vec::new();
+        if self.read_safe {
+            self.activate_reads(&[id], &mut actions);
+        } else {
+            // The commit index is not yet provably current (just-elected leader);
+            // hold the read until the term's first commit makes it so.
+            self.waiting_reads.push(id);
+        }
+        self.release_ready_reads(&mut actions);
+        Ok(actions)
+    }
+
+    /// Opens a confirmation round for `ids`: records each read at the current
+    /// commit index and probes the cluster to confirm this node is still leader.
+    fn activate_reads(&mut self, ids: &[u64], actions: &mut Vec<Action>) {
+        if ids.is_empty() {
+            return;
+        }
+        self.read_seq += 1;
+        let seq = self.read_seq;
+        let read_index = self.commit_index;
+        for &id in ids {
+            self.pending_reads.push((id, seq, read_index));
+        }
+        self.send_read_probe(actions);
+    }
+
+    /// Activates reads that arrived before the commit index became provably
+    /// current, now that it is.
+    fn activate_waiting_reads(&mut self, actions: &mut Vec<Action>) {
+        if self.waiting_reads.is_empty() {
+            return;
+        }
+        let ids = core::mem::take(&mut self.waiting_reads);
+        self.activate_reads(&ids, actions);
+    }
+
+    /// Broadcasts a [`ReadProbe`] for the current confirmation round to every peer.
+    fn send_read_probe(&mut self, actions: &mut Vec<Action>) {
+        let seq = self.read_seq;
+        let term = self.current_term;
+        let leader = self.id;
+        for &peer in &self.voters {
+            if peer == leader {
+                continue;
+            }
+            actions.push(Action::Send {
+                to: peer,
+                message: Message::ReadProbe(ReadProbe { term, leader, seq }),
+            });
+        }
+    }
+
+    /// Handles a peer's read probe: a valid leader contact, answered with a
+    /// matching [`ReadProbeReply`]. A stale prober is told our higher term so it
+    /// steps down. The term step-down for a *newer* prober ran before dispatch.
+    fn handle_read_probe(&mut self, rpc: ReadProbe, actions: &mut Vec<Action>) {
+        if rpc.term >= self.current_term {
+            self.role = Role::Follower;
+            self.leader_id = Some(rpc.leader);
+            self.pre_voting = false;
+            self.reset_election_timer();
+        }
+        actions.push(Action::Send {
+            to: rpc.leader,
+            message: Message::ReadProbeReply(ReadProbeReply {
+                term: self.current_term,
+                from: self.id,
+                seq: rpc.seq,
+            }),
+        });
+    }
+
+    /// Records a follower's read-probe acknowledgement and releases any read whose
+    /// leadership confirmation is now complete.
+    fn handle_read_probe_reply(&mut self, reply: ReadProbeReply, actions: &mut Vec<Action>) {
+        if self.role != Role::Leader || reply.term != self.current_term {
+            return;
+        }
+        if let Some(i) = self.progress_index(reply.from) {
+            if reply.seq > self.progress[i].acked_read_seq {
+                self.progress[i].acked_read_seq = reply.seq;
+            }
+            self.release_ready_reads(actions);
+        }
+    }
+
+    /// The highest confirmation round a quorum (this leader plus matching voters)
+    /// has acknowledged. Reads whose round is at or below this have proven the
+    /// leader still holds the cluster.
+    fn confirmed_read_seq(&self) -> u64 {
+        let quorum = self.quorum();
+        // The leader has, by definition, reached the latest round itself.
+        let mut seqs: Vec<u64> = Vec::with_capacity(self.voters.len());
+        seqs.push(self.read_seq);
+        for p in &self.progress {
+            if self.voters.contains(&p.id) {
+                seqs.push(p.acked_read_seq);
+            }
+        }
+        if seqs.len() < quorum {
+            return 0;
+        }
+        seqs.sort_unstable_by(|a, b| b.cmp(a));
+        seqs[quorum - 1]
+    }
+
+    /// Emits [`Action::ReadReady`] for every pending read whose leadership round is
+    /// confirmed and whose read index has been applied.
+    fn release_ready_reads(&mut self, actions: &mut Vec<Action>) {
+        if self.pending_reads.is_empty() {
+            return;
+        }
+        let confirmed = self.confirmed_read_seq();
+        let applied = self.last_applied;
+        let mut i = 0;
+        while i < self.pending_reads.len() {
+            let (id, seq, read_index) = self.pending_reads[i];
+            if seq <= confirmed && applied >= read_index {
+                actions.push(Action::ReadReady {
+                    id,
+                    index: read_index,
+                });
+                let _ = self.pending_reads.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     fn handle_append_entries(
@@ -2151,10 +2400,14 @@ mod tests {
         assert!(leader.is_leader());
         let _ = pending;
 
-        // Pump messages between the two until the follower catches up.
+        // Pump messages between the two until the follower catches up. The leader
+        // appended a no-op of its new term on election (it took over with an
+        // uncommitted tail), so its log is one longer than the three seed entries.
+        let target = leader.log().last_index();
+        assert_eq!(target, 4);
         let mut queue: Vec<(NodeId, Message)> = drain_sends(&mut leader);
         for _ in 0..100 {
-            if follower.log().last_index() == 3 {
+            if follower.log().last_index() == target {
                 break;
             }
             let mut next = Vec::new();
@@ -2176,7 +2429,8 @@ mod tests {
                     .collect();
             }
         }
-        assert_eq!(follower.log().last_index(), 3);
+        assert_eq!(follower.log().last_index(), target);
+        // The three original term-1 entries survived the backtracking.
         assert_eq!(follower.log().entry(3).unwrap().term, 1);
     }
 
@@ -2634,5 +2888,130 @@ mod tests {
             let _ = node.step(Event::Tick).unwrap();
         }
         assert_eq!(node.role(), Role::Follower);
+    }
+
+    // ---- v0.9 linearizable reads ------------------------------------------
+
+    fn read_ready(actions: &[Action], id: u64) -> Option<Index> {
+        actions.iter().find_map(|a| match a {
+            Action::ReadReady { id: i, index } if *i == id => Some(*index),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn test_read_on_follower_is_rejected() {
+        let mut node = RaftNode::new(RaftConfig::new(1, [2, 3]));
+        let err = node.step(Event::Read { id: 1 }).unwrap_err();
+        assert!(matches!(err, Error::NotLeader { .. }));
+    }
+
+    #[test]
+    fn test_single_node_read_reflects_committed_writes() {
+        let mut node = RaftNode::new(RaftConfig::single(1));
+        drive_to_leader(&mut node);
+        let _ = node.step(Event::Propose(b"a".to_vec())).unwrap();
+        let _ = node.step(Event::Propose(b"b".to_vec())).unwrap();
+        assert_eq!(node.commit_index(), 2);
+        // A lone leader is its own quorum, so the read is ready at once, at the
+        // index covering both committed writes.
+        let actions = node.step(Event::Read { id: 42 }).unwrap();
+        assert_eq!(read_ready(&actions, 42), Some(2));
+    }
+
+    #[test]
+    fn test_multi_node_read_waits_for_a_leadership_quorum() {
+        let mut node = elect_multi_node_leader(); // leader 1 of {1,2,3}
+        // The request alone does not satisfy the read: it emits probes and waits.
+        let actions = node.step(Event::Read { id: 7 }).unwrap();
+        assert_eq!(read_ready(&actions, 7), None);
+        let probes = actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    Action::Send {
+                        message: Message::ReadProbe(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(probes, 2); // one to each peer
+
+        // A single follower's probe acknowledgement completes the quorum (self+1)
+        // and releases the read.
+        let actions = node
+            .step(Event::Message(Message::ReadProbeReply(ReadProbeReply {
+                term: node.term(),
+                from: 2,
+                seq: 1,
+            })))
+            .unwrap();
+        assert_eq!(read_ready(&actions, 7), Some(node.commit_index()));
+    }
+
+    #[test]
+    fn test_follower_answers_a_read_probe() {
+        let mut node = RaftNode::new(RaftConfig::new(5, [1, 2, 3]));
+        let actions = node
+            .step(Event::Message(Message::ReadProbe(ReadProbe {
+                term: 3,
+                leader: 1,
+                seq: 9,
+            })))
+            .unwrap();
+        // It recognises the leader and answers with the matching round.
+        assert_eq!(node.leader(), Some(1));
+        let reply = actions.iter().find_map(|a| match a {
+            Action::Send {
+                message: Message::ReadProbeReply(r),
+                ..
+            } => Some(r.clone()),
+            _ => None,
+        });
+        let reply = reply.expect("a read-probe reply");
+        assert_eq!(reply.seq, 9);
+        assert_eq!(reply.from, 5);
+    }
+
+    #[test]
+    fn test_read_requested_before_first_term_commit_waits() {
+        // A leader that took over with an uncommitted earlier-term tail is not
+        // read-safe until its election no-op commits. With no followers to ack,
+        // the no-op never commits, so the read stays pending.
+        let mut log = MemoryLog::new();
+        log.append(&[entry(1, 1), entry(1, 2)]).unwrap();
+        log.set_hard_state(HardState {
+            term: 1,
+            voted_for: Some(1),
+        })
+        .unwrap();
+        let mut node =
+            RaftNode::with_log(RaftConfig::new(1, [2, 3]).with_election_timeout(5, 5), log);
+        for _ in 0..10 {
+            let _ = node.step(Event::Tick).unwrap();
+            let _ = node.step(Event::Message(Message::PreVoteReply(PreVoteReply {
+                term: node.term(),
+                vote_granted: true,
+                from: 2,
+            })));
+            if node.role() == Role::Candidate {
+                let _ = node.step(Event::Message(Message::RequestVoteReply(
+                    RequestVoteReply {
+                        term: node.term(),
+                        vote_granted: true,
+                        from: 2,
+                    },
+                )));
+            }
+            if node.is_leader() {
+                break;
+            }
+        }
+        assert!(node.is_leader());
+        // Uncommitted tail at election → not yet read-safe.
+        let actions = node.step(Event::Read { id: 1 }).unwrap();
+        assert_eq!(read_ready(&actions, 1), None);
     }
 }

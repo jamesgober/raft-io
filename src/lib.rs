@@ -14,19 +14,20 @@
 //!
 //! ## Status
 //!
-//! This is `v0.8`: **alpha — feature complete, hardened, in consumer
-//! integration.** The full protocol — election (with [pre-vote] disruption
-//! protection), replication, durable crash recovery (`persistence`), snapshots,
-//! membership changes, and leadership transfer — is in place and verified by a
+//! This is `v0.9`: **beta — feature complete, hardened, soaking toward 1.0.** The
+//! full protocol — election (with [pre-vote] disruption protection), replication,
+//! durable crash recovery (`persistence`), snapshots, membership changes,
+//! leadership transfer, and **linearizable reads** ([`Event::Read`] →
+//! [`Action::ReadReady`], the ReadIndex protocol) — is in place and verified by a
 //! kitchen-sink adversarial test suite that asserts all five Raft safety
 //! properties under combined partitions, message loss/reorder/duplication,
-//! membership churn, and snapshotting, plus an application-level suite that
-//! drives a replicated key-value store to convergence under the same faults. The
-//! public traits and the wire and WAL formats are frozen (see `docs/PROTOCOL.md`);
-//! the decode path is fuzzed. Additions in this line stay MINOR-compatible — the
-//! pre-vote messages, for instance, are new `#[non_exhaustive]` enum variants that
-//! leave every existing wire and WAL encoding untouched. See `docs/API.md` for the
-//! full surface.
+//! membership churn, and snapshotting, plus an application-level suite that drives
+//! a replicated key-value store to convergence — and serves linearizable reads —
+//! under the same faults. The public traits and the wire and WAL formats are
+//! frozen (see `docs/PROTOCOL.md`); the decode path is fuzzed. Additions in this
+//! line stay MINOR-compatible — the pre-vote and read-probe messages, for
+//! instance, are new `#[non_exhaustive]` enum variants that leave every existing
+//! wire and WAL encoding untouched. See `docs/API.md` for the full surface.
 //!
 //! [pre-vote]: PreVote
 //!
@@ -94,7 +95,7 @@ pub use crate::error::{Error, Result};
 pub use crate::log::{MemoryLog, RaftLog};
 pub use crate::message::{
     AppendEntries, AppendEntriesReply, InstallSnapshot, InstallSnapshotReply, Message, PreVote,
-    PreVoteReply, RequestVote, RequestVoteReply, TimeoutNow,
+    PreVoteReply, ReadProbe, ReadProbeReply, RequestVote, RequestVoteReply, TimeoutNow,
 };
 pub use crate::node::{Action, Event, RaftNode};
 pub use crate::transport::{MemoryTransport, RaftTransport};

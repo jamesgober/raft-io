@@ -74,6 +74,8 @@ struct Cluster {
     /// The committed command at each index, the source of truth for the model.
     committed: BTreeMap<u64, Vec<u8>>,
     next_key: u64,
+    /// `(node index, read index)` for every linearizable read that became ready.
+    reads_ready: Vec<(usize, u64)>,
 }
 
 impl Cluster {
@@ -100,6 +102,7 @@ impl Cluster {
             side: None,
             committed: BTreeMap::new(),
             next_key: 0,
+            reads_ready: Vec::new(),
         }
     }
 
@@ -139,6 +142,7 @@ impl Cluster {
                     self.absorb(idx, reply);
                 }
                 Action::RestoreSnapshot { data, .. } => self.nodes[idx].store.restore(&data),
+                Action::ReadReady { index, .. } => self.reads_ready.push((idx, index)),
                 _ => {}
             }
         }
@@ -231,6 +235,24 @@ impl Cluster {
         }
         false
     }
+
+    /// Issues a linearizable read on the current leader and settles until it is
+    /// ready, returning `(node index, read index, the store snapshot served)`.
+    /// The store snapshot is the leader's map at the moment the read resolved —
+    /// what the application would return to the client.
+    fn linearizable_read(&mut self, id: u64) -> Option<(usize, u64, KvStore)> {
+        let leader = self.nodes.iter().position(|n| n.raft.is_leader())?;
+        self.reads_ready.clear();
+        let actions = self.nodes[leader].raft.step(Event::Read { id }).ok()?;
+        self.absorb(leader, actions);
+        for _ in 0..400 {
+            if let Some(&(idx, read_index)) = self.reads_ready.first() {
+                return Some((idx, read_index, self.nodes[idx].store.clone()));
+            }
+            self.settle(1);
+        }
+        None
+    }
 }
 
 /// After writes, a partition, healing, and snapshotting, every node's
@@ -265,6 +287,55 @@ fn kv_store_converges_to_the_model_after_partition_and_snapshots() {
             node.id
         );
     }
+}
+
+/// A linearizable read, served after the cluster has committed a series of
+/// writes, reflects every committed write — it returns exactly the model state.
+#[test]
+fn linearizable_read_reflects_all_committed_writes() {
+    let mut cluster = Cluster::new(5, 6);
+    cluster.settle(40);
+    for _ in 0..20 {
+        cluster.write();
+        cluster.settle(3);
+    }
+    assert!(cluster.settle_until_converged(800), "did not converge");
+
+    let committed_before = cluster.committed.keys().next_back().copied().unwrap_or(0);
+    let (_node, read_index, served) = cluster
+        .linearizable_read(1)
+        .expect("the read should resolve on a healthy cluster");
+    // The read point covers everything committed before the read was issued.
+    assert!(read_index >= committed_before, "read index behind commit");
+    // On a quiesced cluster the served state equals the full committed model:
+    // the read missed nothing that was committed.
+    let model = cluster.model();
+    assert_eq!(served, model, "linearizable read returned stale state");
+}
+
+/// Read-your-writes across a partition heal: after a minority is isolated, the
+/// majority commits writes, the cluster heals, and a linearizable read then
+/// reflects those writes (never the pre-partition state).
+#[test]
+fn linearizable_read_after_partition_sees_majority_writes() {
+    let mut cluster = Cluster::new(5, 8);
+    cluster.settle(40);
+    for _ in 0..10 {
+        cluster.write();
+        cluster.settle(3);
+    }
+    // Isolate a minority; the majority keeps committing.
+    cluster.side = Some(vec![false, false, false, true, true]);
+    for _ in 0..15 {
+        cluster.write();
+        cluster.settle(3);
+    }
+    cluster.side = None;
+    assert!(cluster.settle_until_converged(800), "did not converge");
+
+    let (_node, _index, served) = cluster.linearizable_read(99).expect("read resolves");
+    let model = cluster.model();
+    assert_eq!(served, model, "read did not reflect the majority's writes");
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -317,6 +388,18 @@ proptest! {
         let model = cluster.model();
         for node in &cluster.nodes {
             prop_assert_eq!(&node.store, &model, "node {} diverged from the model", node.id);
+        }
+        // A linearizable read on the healed cluster is never stale: its read
+        // index covers every entry committed before the read was issued —
+        // whatever schedule of partitions and reorderings preceded it.
+        let committed_before = cluster.committed.keys().next_back().copied().unwrap_or(0);
+        if let Some((_node, read_index, _served)) = cluster.linearizable_read(1) {
+            prop_assert!(
+                read_index >= committed_before,
+                "read index {} is behind the committed point {}",
+                read_index,
+                committed_before
+            );
         }
     }
 }

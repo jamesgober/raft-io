@@ -58,11 +58,11 @@
 
 ```toml
 [dependencies]
-raft-io = "0.8"
+raft-io = "0.9"
 
 # Optional features:
-raft-io = { version = "0.8", features = ["persistence"] } # durable wal-db-backed `WalLog`
-raft-io = { version = "0.8", features = ["framing"] }     # pack-io wire framing for messages
+raft-io = { version = "0.9", features = ["persistence"] } # durable wal-db-backed `WalLog`
+raft-io = { version = "0.9", features = ["framing"] }     # pack-io wire framing for messages
 ```
 
 <br>
@@ -119,20 +119,21 @@ cargo run --example persistent_node --features persistence  # log survives a res
 
 ## Status
 
-This is `v0.8.0`: **alpha — feature complete, hardened, in consumer integration.**
-The full protocol — election (with pre-vote disruption protection), replication,
-durable crash recovery, snapshots, membership changes, and leadership transfer — is
-in place. A kitchen-sink adversarial test suite drives clusters through combined
-partitions, message loss/reorder/duplication, membership churn, and snapshotting,
-and asserts all five Raft safety properties (Election Safety, Leader Append-Only,
-Log Matching, Leader Completeness, State Machine Safety) continuously over sustained
-runs; a companion suite drives a replicated key-value store — the library's first
-real consumer — to identical state on every node under the same faults; and the
-decode path is fuzzed. The public traits and the wire and WAL formats are **frozen**
-— see the normative <a href="./docs/PROTOCOL.md"><code>docs/PROTOCOL.md</code></a>;
-additions in the 0.x line stay MINOR-compatible (the pre-vote messages are new
-<code>#[non_exhaustive]</code> enum variants that change no existing encoding). Beta
-and RC hardening follow toward the `1.0` freeze, per the
+This is `v0.9.0`: **beta — feature complete, hardened, soaking toward 1.0.** The
+full protocol — election (with pre-vote disruption protection), replication, durable
+crash recovery, snapshots, membership changes, leadership transfer, and
+**linearizable reads** (the ReadIndex protocol) — is in place. A kitchen-sink
+adversarial test suite drives clusters through combined partitions, message
+loss/reorder/duplication, membership churn, and snapshotting, and asserts all five
+Raft safety properties (Election Safety, Leader Append-Only, Log Matching, Leader
+Completeness, State Machine Safety) continuously over sustained runs; a companion
+suite drives a replicated key-value store to identical state on every node — and
+serves stale-free linearizable reads — under the same faults; and the decode path is
+fuzzed. The public traits and the wire and WAL formats are **frozen** — see the
+normative <a href="./docs/PROTOCOL.md"><code>docs/PROTOCOL.md</code></a>; additions in
+the 0.x line stay MINOR-compatible (the pre-vote and read-probe messages are new
+<code>#[non_exhaustive]</code> enum variants that change no existing encoding). RC
+hardening and final benchmarks follow toward the `1.0` freeze, per the
 <a href="./.dev/ROADMAP.md"><code>ROADMAP</code></a> (development copy). The full
 public surface is documented in <a href="./docs/API.md"><code>docs/API.md</code></a>.
 

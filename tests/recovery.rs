@@ -31,8 +31,11 @@ struct Cluster {
     /// `None` while a node is momentarily down between drop and reopen.
     nodes: Vec<Option<RaftNode<WalLog>>>,
     wire: Vec<(NodeId, NodeId, Message)>,
-    /// Per-node applied commands for the current incarnation (cleared on crash).
-    applied: Vec<Vec<Vec<u8>>>,
+    /// Per-node highest applied index for the current incarnation (cleared on
+    /// crash). Applied indices increase strictly but need not be contiguous:
+    /// configuration entries (including the no-op a leader appends on election)
+    /// advance the index without producing an `Apply`.
+    applied: Vec<Option<u64>>,
     /// Agreed command at each committed index, across all incarnations.
     committed: BTreeMap<u64, Vec<u8>>,
     next_value: u64,
@@ -64,7 +67,7 @@ impl Cluster {
             n,
             nodes,
             wire: Vec::new(),
-            applied: vec![Vec::new(); n],
+            applied: vec![None; n],
             committed: BTreeMap::new(),
             next_value: 1,
         }
@@ -84,13 +87,13 @@ impl Cluster {
             match action {
                 Action::Send { to, message } => self.wire.push((from, to, message)),
                 Action::Apply { index, command, .. } => {
-                    let log = &mut self.applied[i];
-                    assert_eq!(
-                        index as usize,
-                        log.len() + 1,
-                        "node {from} applied index {index} out of order"
-                    );
-                    log.push(command.clone());
+                    if let Some(prev) = self.applied[i] {
+                        assert!(
+                            index > prev,
+                            "node {from} applied index {index} out of order (after {prev})"
+                        );
+                    }
+                    self.applied[i] = Some(index);
                     match self.committed.get(&index) {
                         Some(existing) => assert_eq!(
                             *existing, command,
@@ -148,7 +151,7 @@ impl Cluster {
             recovered.term()
         );
         self.nodes[i] = Some(recovered);
-        self.applied[i].clear(); // a fresh incarnation re-applies from its log
+        self.applied[i] = None; // a fresh incarnation re-applies from its log
     }
 
     fn settle(&mut self, rounds: usize) {
