@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "raft-io"
-version = "1.0.0"
+version = "1.1.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -82,8 +82,10 @@ error-forge = { version = "1", default-features = false }
 # Durable write-ahead log backing `WalLog`, behind the `persistence` feature.
 # Byte-record API only (no `pack-io` feature): raft-io frames its own records.
 wal-db = { version = "1.0", optional = true, default-features = false }
-# Typed message framing, behind the `framing` feature.
-pack-io = { version = "1.0", optional = true, default-features = false }
+# Typed message framing, behind the `framing` feature. pack-io 2 decodes
+# untrusted input with bounded allocation and nesting; its wire format is the
+# same as 1.x (tests/wire_compat.rs pins raft-io's 1.0 bytes).
+pack-io = { version = "2", optional = true, default-features = false }
 
 
 # DEV DEPENDENCIES
