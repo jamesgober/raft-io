@@ -279,13 +279,17 @@ decline new client proposals.
 
 ## 8. Wire framing (`framing` feature)
 
-Messages are serialized with `pack-io`. The encoding is deterministic and
+Messages are serialized with `pack-io` (version 2 since raft-io 1.1.0; the
+bytes are identical to the pack-io 1 encoding raft-io 1.0 used, so 1.0 and 1.1
+nodes interoperate). The encoding is deterministic and
 canonical: a value that decodes MUST re-encode to the identical bytes. An enum
 (such as `Message`) is encoded as a varint variant tag followed by the variant's
 fields in declaration order; integers are little-endian; a byte string and a
 sequence are length-prefixed. A decoder MUST treat all input as untrusted: it MUST
-fail with an error rather than panic on malformed bytes, and the transport SHOULD
-drop a message that fails to decode (Raft already tolerates loss).
+fail with an error rather than panic on malformed bytes, MUST NOT allocate in
+proportion to a declared length or count before the input has supplied those
+bytes, and the transport SHOULD drop a message that fails to decode (Raft
+already tolerates loss).
 
 ## 9. Durable log format (`persistence` feature)
 

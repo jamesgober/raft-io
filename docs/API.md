@@ -1073,7 +1073,8 @@ signatures read `Result<T>`.
 
 _Requires the `framing` feature._
 
-Typed wire encoding for [`Message`](#message), built on `pack-io`. The protocol
+Typed wire encoding for [`Message`](#message), built on `pack-io` 2 (wire-identical
+to the pack-io 1 encoding of raft-io 1.0). The protocol
 emits [`Action::Send`](#action) carrying a `Message` and leaves delivery to you;
 this module supplies the codec when your transport needs one. The message types
 derive `pack_io::Serialize` / `Deserialize` under the feature.
@@ -1081,7 +1082,7 @@ derive `pack_io::Serialize` / `Deserialize` under the feature.
 | Function | Signature | Description |
 |---|---|---|
 | `encode` | `fn encode(message: &Message) -> Result<Vec<u8>>` | Serialize a message to wire bytes. |
-| `decode` | `fn decode(bytes: &[u8]) -> Result<Message>` | Read a message back. A failure is [`Error::Encoding`](#error) — treat it like a dropped message, not a crash. |
+| `decode` | `fn decode(bytes: &[u8]) -> Result<Message>` | Read a message back. A failure is [`Error::Encoding`](#error); treat it like a dropped message, not a crash. Safe on untrusted input: never panics, and allocation is bounded by the input length. |
 
 ```rust
 # #[cfg(feature = "framing")] {

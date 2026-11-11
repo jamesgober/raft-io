@@ -13,6 +13,12 @@
 //! does not need it. A decode failure yields [`Error::Encoding`](crate::Error),
 //! which a transport should treat like a dropped message rather than a fatal
 //! error.
+//!
+//! [`decode`] is built for bytes from untrusted peers: it never panics, and the
+//! memory it allocates is bounded by the length of the input, whatever lengths
+//! or counts the input claims. Since 1.1.0 the codec is pack-io 2, whose wire
+//! format is identical to the pack-io 1 format raft-io 1.0 used, so nodes on
+//! any 1.x release can share a cluster.
 
 use crate::error::{Error, Result};
 use crate::message::Message;
@@ -44,7 +50,9 @@ pub fn encode(message: &Message) -> Result<Vec<u8>> {
 /// # Errors
 ///
 /// Returns [`Error::Encoding`](crate::Error) if the bytes are not a valid
-/// encoded message.
+/// encoded message, including when a length or count in the input runs past
+/// the end of the input. Decoding never panics and never allocates in
+/// proportion to a length the input merely claims.
 ///
 /// # Examples
 ///

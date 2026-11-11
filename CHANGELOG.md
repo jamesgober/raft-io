@@ -9,13 +9,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Added
+---
+
+## [1.1.0] - 2026-11-11
+
+### Security
+
+- The `framing` feature now decodes with `pack-io` 2, whose decoder is safe on
+  untrusted input: it never panics, and allocation is bounded by the input
+  length rather than by lengths the input declares. `framing::decode` runs on
+  bytes from peers, so upgrade if you use `framing`.
 
 ### Changed
 
-### Fixed
+- `pack-io` dependency (feature `framing`) moved from `1.0` to `2`. The wire
+  bytes are unchanged: `tests/wire_compat.rs` checks `framing::encode` against
+  vectors written by raft-io 1.0.0 and decodes them back, for every message
+  variant. Nodes on 1.0.x and 1.1.x interoperate.
+- The `pack_io::Serialize` / `Deserialize` impls derived on the message types
+  now implement the pack-io 2 traits. Code that calls those impls directly
+  through its own `pack-io = "1"` dependency must move to `pack-io = "2"`.
+  `framing::encode` and `framing::decode` are unchanged.
 
-### Security
+### Added
+
+- `tests/hostile_decode.rs`: adversarial decode tests that track the largest
+  allocation `framing::decode` makes for short inputs declaring huge lengths.
 
 ---
 
@@ -425,7 +444,8 @@ Initial scaffold and repository bootstrap. No raft-io logic yet &mdash; this rel
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/raft-io/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/raft-io/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/jamesgober/raft-io/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/raft-io/compare/v0.10.1...v1.0.0
 [0.10.1]: https://github.com/jamesgober/raft-io/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/jamesgober/raft-io/compare/v0.9.0...v0.10.0
