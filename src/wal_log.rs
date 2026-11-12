@@ -14,11 +14,23 @@
 //! write-ahead log, which frames and checksums each record. An in-memory index
 //! (a [`MemoryLog`]) mirrors the current state for fast reads. On
 //! [`open`](WalLog::open) the records are replayed in order to rebuild that index
-//! exactly. Installing a snapshot writes a snapshot record and then physically
-//! drops every earlier record from the WAL (re-persisting the current hard state
-//! first), so the file stays bounded as the log is compacted.
+//! exactly.
+//!
+//! Installing a snapshot compacts the file. The store writes a fresh WAL next
+//! to the live one (`<path>.compact`) holding only the snapshot, the entries
+//! above it and the current hard state, syncs it, and renames it over the live
+//! file, so the file holds one snapshot and the live tail instead of growing
+//! with every entry and snapshot ever written. The rename is the commit point:
+//! a crash before it leaves the old file, which is complete, and a leftover
+//! `.compact` file is removed on the next [`open`](WalLog::open); a crash after
+//! it leaves the compacted file. The rename is made durable by the next
+//! [`sync`](RaftLog::sync), which the protocol issues right after installing a
+//! snapshot. If compaction fails for any reason short of the rename, the
+//! snapshot is appended to the live file instead, as before 1.2.0.
 //!
 //! [`RaftLog`]: crate::RaftLog
+
+use std::path::{Path, PathBuf};
 
 use wal_db::Wal;
 
@@ -58,8 +70,18 @@ const TAG_SNAPSHOT: u8 = 4;
 /// ```
 #[cfg_attr(docsrs, doc(cfg(feature = "persistence")))]
 pub struct WalLog {
-    wal: Wal,
+    /// The live WAL. `None` only if reopening it after a compaction failed,
+    /// after which every write reports a storage error.
+    wal: Option<Wal>,
+    path: PathBuf,
     index: MemoryLog,
+}
+
+/// The path of the compaction scratch file for the log at `path`.
+fn compact_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".compact");
+    PathBuf::from(name)
 }
 
 impl WalLog {
@@ -75,7 +97,15 @@ impl WalLog {
     /// Returns [`Error::Storage`] if the WAL cannot be opened or a record fails
     /// to decode (for example, a checksum mismatch reported by `wal-db`).
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let wal = Wal::open(path).map_err(|e| Error::storage("open durable log", e))?;
+        let path = path.as_ref().to_path_buf();
+        // A scratch file from a compaction interrupted before its rename: the
+        // live file is complete without it.
+        let scratch = compact_path(&path);
+        if scratch.exists() {
+            std::fs::remove_file(&scratch)
+                .map_err(|e| Error::storage("remove interrupted compaction", e))?;
+        }
+        let wal = Wal::open(&path).map_err(|e| Error::storage("open durable log", e))?;
         let mut index = MemoryLog::new();
         let iter = wal
             .iter()
@@ -89,16 +119,87 @@ impl WalLog {
                 Decoded::Snapshot(snapshot) => index.apply_snapshot(&snapshot)?,
             }
         }
-        Ok(Self { wal, index })
+        Ok(Self {
+            wal: Some(wal),
+            path,
+            index,
+        })
+    }
+
+    /// The live WAL, or a storage error if it could not be reopened after a
+    /// compaction.
+    fn wal(&self) -> Result<&Wal> {
+        self.wal
+            .as_ref()
+            .ok_or_else(|| Error::storage("use durable log", "log closed after a failed reopen"))
     }
 
     /// Appends `record` to the WAL, mapping any backend failure to a storage
     /// error tagged with `context`.
     fn write(&self, context: &'static str, record: &[u8]) -> Result<()> {
-        self.wal
+        self.wal()?
             .append(record)
             .map(|_lsn| ())
             .map_err(|e| Error::storage(context, e))
+    }
+
+    /// Writes the compacted log (the snapshot already applied to the index,
+    /// every live entry above it, and the hard state) to the scratch file and
+    /// syncs it. Returns the scratch path.
+    fn write_compacted(&self, snapshot: &Snapshot) -> Result<PathBuf> {
+        let scratch = compact_path(&self.path);
+        if scratch.exists() {
+            std::fs::remove_file(&scratch)
+                .map_err(|e| Error::storage("remove stale compaction", e))?;
+        }
+        let fresh = Wal::open(&scratch).map_err(|e| Error::storage("open compaction", e))?;
+        let put = |record: &[u8]| {
+            fresh
+                .append(record)
+                .map(|_lsn| ())
+                .map_err(|e| Error::storage("write compaction", e))
+        };
+        put(&encode_snapshot(snapshot))?;
+        let first = self.index.snapshot_index() + 1;
+        let last = self.index.last_index();
+        if last >= first {
+            for entry in self.index.entries(first, last) {
+                put(&encode_entry(&entry))?;
+            }
+        }
+        put(&encode_hard_state(&self.index.hard_state()))?;
+        fresh
+            .sync()
+            .map_err(|e| Error::storage("sync compaction", e))?;
+        drop(fresh);
+        Ok(scratch)
+    }
+
+    /// Replaces the live file with a compacted one. Returns `Ok(false)` when
+    /// the compaction could not be prepared (the live file is untouched and
+    /// the caller falls back to appending), `Ok(true)` once the compacted file
+    /// is live, and an error only if the rename succeeded but the file could
+    /// not be reopened.
+    fn compact(&mut self, snapshot: &Snapshot) -> Result<bool> {
+        let scratch = match self.write_compacted(snapshot) {
+            Ok(path) => path,
+            Err(_) => {
+                let _ = std::fs::remove_file(compact_path(&self.path));
+                return Ok(false);
+            }
+        };
+        // Both handles must be closed for the rename to succeed on Windows.
+        let live = self.wal.take();
+        drop(live);
+        if std::fs::rename(&scratch, &self.path).is_err() {
+            let _ = std::fs::remove_file(&scratch);
+            let wal = Wal::open(&self.path).map_err(|e| Error::storage("reopen durable log", e))?;
+            self.wal = Some(wal);
+            return Ok(false);
+        }
+        let wal = Wal::open(&self.path).map_err(|e| Error::storage("reopen durable log", e))?;
+        self.wal = Some(wal);
+        Ok(true)
     }
 }
 
@@ -154,7 +255,7 @@ impl RaftLog for WalLog {
     }
 
     fn sync(&mut self) -> Result<()> {
-        self.wal
+        self.wal()?
             .sync()
             .map_err(|e| Error::storage("sync durable log", e))
     }
@@ -174,22 +275,20 @@ impl RaftLog for WalLog {
         }
         // Compact the in-memory index first.
         self.index.apply_snapshot(snapshot)?;
-        // Persist the snapshot record, then re-write the current hard state so
-        // the latest term/vote sits *after* the snapshot in the log.
-        let lsn = self
-            .wal
-            .append(&encode_snapshot(snapshot))
-            .map_err(|e| Error::storage("persist snapshot", e))?;
+        // Rewrite the file as snapshot + live tail + hard state, so it holds
+        // only what a restart needs (see the module docs for crash safety).
+        if self.compact(snapshot)? {
+            return Ok(());
+        }
+        // Compaction was not possible: append the snapshot record, then
+        // re-write the current hard state so the latest term/vote sits *after*
+        // the snapshot in the log. Replay re-applies the snapshot record and
+        // reconstructs the same state; the file is merely larger.
+        self.write("persist snapshot", &encode_snapshot(snapshot))?;
         self.write(
             "persist hard state",
             &encode_hard_state(&self.index.hard_state()),
-        )?;
-        // Physically drop every record before the snapshot. This is an
-        // optimisation: if it fails, the WAL is merely larger — replay still
-        // re-applies the snapshot record and reconstructs the same state — so the
-        // outcome is deliberately ignored rather than turned into a fatal error.
-        let _ = self.wal.truncate_before(lsn);
-        Ok(())
+        )
     }
 }
 
@@ -601,5 +700,92 @@ mod tests {
         assert_eq!(log.last_index(), 0);
         drop(log);
         assert_eq!(WalLog::open(&path).unwrap().last_index(), 0);
+    }
+
+    #[test]
+    fn test_snapshots_keep_the_file_bounded() {
+        // 64 KiB of state, a snapshot every 100 entries, five rounds: before
+        // 1.2.0 the file grew by every entry and every snapshot ever written.
+        let (_dir, path) = temp_path();
+        let state = vec![0xab; 64 * 1024];
+        let mut sizes = Vec::new();
+        {
+            let mut log = WalLog::open(&path).unwrap();
+            let mut next = 1;
+            for round in 1..=5u64 {
+                for _ in 0..100 {
+                    log.append(&[entry(1, next, &[0x11; 512])]).unwrap();
+                    next += 1;
+                }
+                log.sync().unwrap();
+                // Snapshot all but the last ten entries.
+                let at = round * 100 - 10;
+                log.apply_snapshot(&Snapshot::new(at, 1, state.clone()))
+                    .unwrap();
+                log.set_hard_state(HardState {
+                    term: round,
+                    voted_for: Some(2),
+                })
+                .unwrap();
+                log.sync().unwrap();
+                sizes.push(std::fs::metadata(&path).unwrap().len());
+            }
+        }
+        // One snapshot plus ten entries, never the history.
+        let bound = (state.len() + 10 * 600 + 4096) as u64;
+        assert!(sizes.iter().all(|&s| s <= bound), "{sizes:?} > {bound}");
+        assert!(!compact_path(&path).exists());
+        let recovered = WalLog::open(&path).unwrap();
+        assert_eq!(recovered.snapshot_index(), 490);
+        assert_eq!(recovered.last_index(), 500);
+        assert_eq!(recovered.entry(491).unwrap().command, vec![0x11; 512]);
+        assert_eq!(recovered.snapshot().unwrap().data, state);
+        assert_eq!(
+            recovered.hard_state(),
+            HardState {
+                term: 5,
+                voted_for: Some(2)
+            }
+        );
+    }
+
+    #[test]
+    fn test_unsynced_tail_and_hard_state_survive_compaction() {
+        let (_dir, path) = temp_path();
+        {
+            let mut log = WalLog::open(&path).unwrap();
+            log.append(&[entry(1, 1, b"a"), entry(1, 2, b"b"), entry(2, 3, b"c")])
+                .unwrap();
+            log.set_hard_state(HardState {
+                term: 2,
+                voted_for: Some(3),
+            })
+            .unwrap();
+            // No sync before the snapshot: the compacted file must still carry
+            // the tail above it and the hard state.
+            log.apply_snapshot(&Snapshot::new(1, 1, b"s".to_vec()))
+                .unwrap();
+            log.sync().unwrap();
+        }
+        let recovered = WalLog::open(&path).unwrap();
+        assert_eq!(recovered.snapshot_index(), 1);
+        assert_eq!(recovered.last_index(), 3);
+        assert_eq!(recovered.entry(3).unwrap().command, b"c");
+        assert_eq!(recovered.hard_state().voted_for, Some(3));
+    }
+
+    #[test]
+    fn test_leftover_compaction_file_is_ignored_on_open() {
+        let (_dir, path) = temp_path();
+        {
+            let mut log = WalLog::open(&path).unwrap();
+            log.append(&[entry(1, 1, b"a")]).unwrap();
+            log.sync().unwrap();
+        }
+        // A scratch file from a compaction that crashed before its rename.
+        std::fs::write(compact_path(&path), b"partial garbage").unwrap();
+        let recovered = WalLog::open(&path).unwrap();
+        assert_eq!(recovered.last_index(), 1);
+        assert!(!compact_path(&path).exists());
     }
 }

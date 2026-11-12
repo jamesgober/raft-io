@@ -6,9 +6,12 @@
 //! The protocol core is a **deterministic state machine**: you feed it
 //! [`Event`]s (logical ticks, inbound [`Message`]s, client proposals) and it
 //! returns [`Action`]s (send these messages, apply this committed command).
-//! Time, networking, and storage are *your* concern, injected through the
-//! [`RaftLog`] and [`RaftTransport`] trait seams. That separation is exactly
-//! what makes the consensus core provable: it contains no wall clock and no
+//! Time, networking, and storage are *your* concern: storage is injected
+//! through the [`RaftLog`] trait, and networking is whatever your driver does
+//! with each [`Action::Send`] (the node never sends anything itself;
+//! [`RaftTransport`] is an optional trait for such a driver to implement, and
+//! the node never calls it). That separation is exactly what makes the
+//! consensus core provable: it contains no wall clock and no
 //! I/O, so an entire cluster's behaviour can be reproduced from a seed and a
 //! sequence of events.
 //!
@@ -20,9 +23,12 @@
 //! membership changes with non-voting [learners]
 //! ([`Event::AddLearner`] / [`Event::PromoteLearner`]), leadership transfer, and
 //! **linearizable reads** ([`Event::Read`] → [`Action::ReadReady`], the ReadIndex
-//! protocol). All five Raft safety properties are asserted continuously by a
-//! kitchen-sink adversarial test suite under combined partitions, message
-//! loss/reorder/duplication, membership churn, and snapshotting; an
+//! protocol). Election safety, log matching, leader completeness and state
+//! machine safety, plus monotonic commit and apply indexes, are asserted by a
+//! seeded simulation with crash-restart on a log that loses unsynced writes,
+//! partitions, message loss/reorder/duplication, membership churn (including
+//! an isolated leader holding an uncommitted configuration change), leadership
+//! transfer, and snapshotting, and by kitchen-sink adversarial suites; an
 //! application-level suite drives a replicated key-value store to convergence —
 //! and serves stale-free linearizable reads — under the same faults; and the
 //! decode path is fuzzed. The public API, the wire format, and the durable log
@@ -40,8 +46,9 @@
 //!   in-memory [`MemoryLog`].
 //! - **Tier 2** — [`RaftConfig`]'s builder for tuning election and heartbeat
 //!   timing.
-//! - **Tier 3** — the [`RaftLog`] / [`RaftTransport`] traits for plugging in a
-//!   durable store or a real transport.
+//! - **Tier 3**: the [`RaftLog`] trait for plugging in a durable store, and
+//!   your own driver for [`Action::Send`] (optionally behind the
+//!   [`RaftTransport`] trait) for a real network.
 //!
 //! ## Example — a single-node cluster elects itself and commits
 //!
@@ -60,7 +67,8 @@
 //! // A leader commits its own proposals immediately (quorum of one).
 //! let actions = node.step(Event::Propose(b"set x = 1".to_vec())).unwrap();
 //! assert!(actions.iter().any(|a| matches!(a, Action::Apply { .. })));
-//! assert_eq!(node.commit_index(), 1);
+//! // Index 1 is the leader's election no-op; the proposal is index 2.
+//! assert_eq!(node.commit_index(), 2);
 //! ```
 //!
 //! [Raft consensus algorithm]: https://raft.github.io/

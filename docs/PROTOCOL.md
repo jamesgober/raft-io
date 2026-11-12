@@ -231,16 +231,27 @@ uncommitted entry.
 When a follower's required next entry has been compacted out of the leader's log,
 the leader sends `InstallSnapshot` instead of `AppendEntries`. A follower MUST
 install a snapshot only if it advances beyond what the follower already holds
-(its current snapshot and `commit_index`); otherwise it acknowledges the index it
-already covers without moving its state backwards.
+(its current snapshot, `commit_index` and `last_applied`); otherwise it
+acknowledges the index it already covers without moving its state backwards.
+`commit_index` and `last_applied` MUST never decrease while a node runs: an
+`AppendEntries` that covers less than the follower already committed leaves its
+commit index unchanged. After sending a snapshot the leader SHOULD wait for the
+reply (or a timeout, two maximum election timeouts in raft-io) before sending it
+again, rather than resending it on every heartbeat.
 
 ## 6. Configuration changes
 
 Membership changes one server at a time (§4.1). The leader appends a `Config`
 entry carrying the new voting set and **adopts it immediately on append**, before
-it commits — combined with single-server changes this guarantees the old and new
-majorities always overlap, so two disjoint majorities can never form.
+it commits. Single-server changes keep the old and new majorities overlapping
+only together with the two rules below; without the first, a new leader can
+start a change while another node still holds an uncommitted change from an
+earlier term, and two different entries can commit at one index (Ongaro,
+raft-dev 2015).
 
+- A leader MUST NOT begin a configuration change until it has committed an entry
+  of its own term. raft-io guarantees this by appending a no-op (§11) on every
+  election and refusing changes with `ConfigInProgress` until it commits.
 - A leader MUST NOT begin a new configuration change while a previous `Config`
   entry is still uncommitted (one change in flight at a time).
 - A node determines its current configuration as the latest `Config` entry in its
@@ -275,14 +286,20 @@ A leader MAY hand off to a voting `target`: it brings the target's log fully up 
 date, then sends `TimeoutNow`. The target, on receiving `TimeoutNow`, immediately
 starts a **forced** election (`RequestVote` with `force = true`, §3.4) rather than
 waiting out its election timeout. While a transfer is in progress the leader MUST
-decline new client proposals.
+decline new client proposals and configuration changes (raft-io reports
+`TransferInProgress`). A transfer that has not completed within one (maximum)
+election timeout MUST be abandoned, so an unreachable target cannot stop the
+cluster from accepting writes; a transfer also ends if the target stops being a
+voter.
 
 ## 8. Wire framing (`framing` feature)
 
 Messages are serialized with `pack-io` (version 2 since raft-io 1.1.0; the
 bytes are identical to the pack-io 1 encoding raft-io 1.0 used, so 1.0 and 1.1
 nodes interoperate). The encoding is deterministic and
-canonical: a value that decodes MUST re-encode to the identical bytes. An enum
+canonical: `framing::decode` accepts only the canonical encoding (since 1.2.0), so
+a value that decodes re-encodes to the identical bytes. Decode memory is capped
+at 16 MiB or twice the frame length, whichever is larger. An enum
 (such as `Message`) is encoded as a varint variant tag followed by the variant's
 fields in declaration order; integers are little-endian; a byte string and a
 sequence are length-prefixed. A decoder MUST treat all input as untrusted: it MUST
@@ -306,10 +323,15 @@ little-endian fields:
 | `4` | Snapshot | `index:u64`, `term:u64`, `config_len:u64`, `config:[u64; config_len]`, `data_len:u64`, `data:[u8; data_len]` |
 
 Replay applies records in order: an Entry appends, a HardState replaces, a
-Truncate drops the tail, a Snapshot compacts. Installing a snapshot writes the
-snapshot record, re-persists the current hard state after it, then physically
-drops every earlier record so the file stays bounded; this physical compaction is
-an optimisation and its omission MUST NOT affect the recovered logical state. A
+Truncate drops the tail, a Snapshot compacts. Installing a snapshot rewrites the
+file (since 1.2.0): a fresh WAL at `<path>.compact` receives the Snapshot record,
+an Entry record for every live entry above it, and the current HardState; it is
+synced and renamed over the live file, so the file holds one snapshot and the
+live tail. A leftover `<path>.compact` is deleted on open (the live file is
+complete without it). If the rewrite cannot be prepared, the Snapshot and
+HardState records are appended to the live file instead. Either way the record
+format is unchanged, and this physical compaction MUST NOT affect the recovered
+logical state. A
 decoder MUST reject an unknown tag, a truncated record, or a length that does not
 match the record, with an error rather than a panic.
 
@@ -347,12 +369,15 @@ ReadIndex protocol:
 A read index is only sound once the leader's commit index reflects everything
 truly committed before it took over. A leader that won election holding an
 uncommitted tail of earlier-term entries cannot establish that by replica count
-alone (§3.6), so on becoming leader it MUST, in that case, append a **no-op entry
-of its own term** and may serve reads only once an entry of its current term has
-committed. raft-io encodes this no-op as a configuration entry re-asserting the
-current membership; like any configuration entry it is never applied to the state
-machine, so **applied indices increase strictly but need not be contiguous**, and
-a consumer keys applied state by each entry's index rather than by counting.
+alone (§3.6), so it may serve reads only once an entry of its current term has
+committed. Every raft-io leader appends a **no-op entry of its own term** on
+election (since 1.2.0 even when its log is fully committed, which configuration
+changes require, §6). raft-io encodes this no-op as a configuration entry
+re-asserting the current membership, voters and learners both; like any
+configuration entry it is never applied to the state machine, so **applied
+indices increase strictly but need not be contiguous**, and a consumer keys
+applied state by each entry's index rather than by counting. The first entry a
+new cluster applies is therefore index 2.
 
 If leadership is lost before a read is confirmed, the read is abandoned and the
 client retries against the new leader.

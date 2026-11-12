@@ -53,9 +53,10 @@ sans-I/O state machine**. You feed a [`RaftNode`](#raftnode) [`Event`](#event)s
 — logical ticks, inbound [`Message`](#message)s, client proposals — through one
 method, [`step`](#step), and it returns the [`Action`](#action)s the outside
 world must perform: messages to send and committed commands to apply. The node
-never reads a clock, opens a socket, or touches a disk; time, networking, and
-storage are injected through the [`RaftLog`](#raftlog) and
-[`RaftTransport`](#rafttransport) seams. That separation is what makes the core
+never reads a clock, opens a socket, or touches a disk. Storage is injected
+through the [`RaftLog`](#raftlog) trait; networking is whatever your driver does
+with each [`Action::Send`](#action). [`RaftTransport`](#rafttransport) is an
+optional trait for that driver: the node never calls it. That separation is what makes the core
 provable — an entire run is reproducible from a seed and a sequence of events.
 
 The protocol is **complete**: leader election with full term and vote safety and
@@ -102,7 +103,7 @@ while !node.is_leader() {
 
 let actions = node.step(Event::Propose(b"set x = 1".to_vec())).unwrap();
 assert!(actions.iter().any(|a| matches!(a, Action::Apply { .. })));
-assert_eq!(node.commit_index(), 1);
+assert_eq!(node.commit_index(), 2); // index 1 is the election no-op
 ```
 
 Runnable examples cover each path end to end:
@@ -131,9 +132,10 @@ reachable without ceremony.
   ([`with_election_timeout`](#with_election_timeout),
   [`with_heartbeat_interval`](#with_heartbeat_interval),
   [`with_seed`](#with_seed)) for tuning election and heartbeat timing.
-- **Tier 3 — the power path.** The [`RaftLog`](#raftlog) and
-  [`RaftTransport`](#rafttransport) traits, plugged in with
-  [`RaftNode::with_log`](#with_log), for a durable store or a real transport.
+- **Tier 3:** the power path. The [`RaftLog`](#raftlog) trait, plugged in with
+  [`RaftNode::with_log`](#with_log), for a durable store, and your own driver
+  for [`Action::Send`](#action) (optionally behind
+  [`RaftTransport`](#rafttransport)) for a real transport.
 
 ---
 
@@ -415,7 +417,10 @@ produce the same actions.
   membership change, or `Read`) and this node is not the leader; the error carries
   the known leader so the caller can redirect.
 - [`Error::ConfigInProgress`](#error) — a membership change was requested while a
-  previous one is still uncommitted.
+  previous one is still uncommitted, or before a newly elected leader has
+  committed its election no-op.
+- [`Error::TransferInProgress`](#error): a proposal or membership change reached
+  a leader that is handing leadership to another node.
 - [`Error::Storage`](#error) — the underlying [`RaftLog`](#raftlog) failed on the
   durability path. Fatal to the node.
 
@@ -501,8 +506,10 @@ The input to [`step`](#step). A node only changes state in response to an event:
   index is ignored.
 - **`AddServer(NodeId)`** / **`RemoveServer(NodeId)`** — add a voting server, or
   remove a server (voter or learner) (leader only; [`Error::NotLeader`](#error)
-  elsewhere). One change at a time: a request while a previous one is uncommitted
-  returns [`Error::ConfigInProgress`](#error). The change takes effect immediately
+  elsewhere). One change at a time: a request while a previous one is uncommitted,
+  or before a new leader has committed an entry of its own term (its election
+  no-op, normally one round trip), returns [`Error::ConfigInProgress`](#error).
+  The change takes effect immediately
   on the leader, before it commits. Removing the leader makes it step down once the
   change commits.
 - **`AddLearner(NodeId)`** / **`PromoteLearner(NodeId)`** — add a non-voting
@@ -513,7 +520,9 @@ The input to [`step`](#step). A node only changes state in response to an event:
   `PromoteLearner` is a no-op for an id that is not a current learner.
 - **`TransferLeadership(NodeId)`** — ask the leader to hand off to a voter `target`:
   it catches the target up, then signals it to campaign at once. A no-op on a
-  non-leader or for a non-voting target.
+  non-leader or for a non-voting target. While the transfer is pending, proposals
+  and membership changes return [`Error::TransferInProgress`](#error); a transfer
+  that has not completed within one (maximum) election timeout is abandoned.
 - **`Read { id }`** — request a **linearizable read** tagged with the caller token
   `id` (leader only; [`Error::NotLeader`](#error) elsewhere). The leader confirms
   it still leads a quorum and applies through the read point, then emits
@@ -973,8 +982,12 @@ assert_eq!(recovered.last_index(), node.log().last_index());
 # Ok::<(), raft_io::Error>(())
 ```
 
-Truncated entries remain physically in the WAL until log compaction (snapshots);
-replay still reconstructs the correct logical state. The byte-record API of
+Truncated entries remain physically in the WAL until the next snapshot, which
+rewrites the file as the snapshot, the live entries above it and the hard state
+(written to `<path>.compact`, then renamed over the live file; see
+`docs/PROTOCOL.md` §9), so the file does not grow without bound as long as the
+application snapshots. Replay reconstructs the correct logical state either way.
+The byte-record API of
 `wal-db` is used directly — `raft-io` frames its own records and does not enable
 `wal-db`'s `pack-io` feature.
 
@@ -1028,6 +1041,7 @@ pub enum Error {
     Storage { context: &'static str, detail: String },
     Encoding { context: &'static str, detail: String },
     ConfigInProgress,
+    TransferInProgress { target: NodeId }, // since 1.2.0
 }
 ```
 
@@ -1041,7 +1055,8 @@ severity (`is_retryable` / `is_fatal`) metadata, and is an ordinary
 | `NotLeader { leader }` | A proposal reached a non-leader. `leader` is the best-known leader for the caller to redirect to (`None` during an election). | Retryable, not fatal. |
 | `Storage { context, detail }` | A [`RaftLog`](#raftlog) backend operation failed. `context` names the operation; `detail` is the backend's message. | Fatal, not retryable. |
 | `Encoding { context, detail }` | A message failed to [encode or decode](#framing) (the `framing` feature). | Not fatal — drop the malformed message. |
-| `ConfigInProgress` | A membership change was requested while a previous one is still uncommitted. | Retryable once the in-flight change completes. |
+| `ConfigInProgress` | A membership change was requested while a previous one is still uncommitted, or before a new leader committed its election no-op. | Retryable once the in-flight change completes. |
+| `TransferInProgress { target }` | A proposal or membership change reached a leader that is handing off to `target` (before 1.2.0 this was `NotLeader` naming the leader itself). | Retryable once the transfer completes or is abandoned. |
 
 <a id="error-helpers"></a>**Helpers** — `Error::storage(context, source)` and
 `Error::encoding(context, source)` build the respective error from any `Display`
@@ -1082,7 +1097,9 @@ derive `pack_io::Serialize` / `Deserialize` under the feature.
 | Function | Signature | Description |
 |---|---|---|
 | `encode` | `fn encode(message: &Message) -> Result<Vec<u8>>` | Serialize a message to wire bytes. |
-| `decode` | `fn decode(bytes: &[u8]) -> Result<Message>` | Read a message back. A failure is [`Error::Encoding`](#error); treat it like a dropped message, not a crash. Safe on untrusted input: never panics, and allocation is bounded by the input length. |
+| `decode` | `fn decode(bytes: &[u8]) -> Result<Message>` | Read a message back. A failure is [`Error::Encoding`](#error); treat it like a dropped message, not a crash. Safe on untrusted input: never panics, accepts only the canonical encoding, and the memory it builds is capped by `decode_limit(bytes.len())`. |
+| `decode_limit` | `fn decode_limit(frame_len: usize) -> usize` | The decode memory cap: 16 MiB (pack-io's network preset), or twice the frame length when larger, so large snapshots still decode. Since 1.2.0. |
+| `decode_with_config` | `fn decode_with_config(bytes: &[u8], config: pack_io::Config) -> Result<Message>` | Decode under explicit pack-io limits, for a fixed cap. Since 1.2.0. |
 
 ```rust
 # #[cfg(feature = "framing")] {
