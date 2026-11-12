@@ -521,7 +521,6 @@ Initial scaffold and repository bootstrap. No raft-io logic yet &mdash; this rel
 - `REPS.md` compliance baseline at the repository root.
 - `.github/workflows/ci.yml` &mdash; Linux/macOS/Windows CI matrix on stable and MSRV, plus loom and audit/deny jobs.
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
-- `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
 [Unreleased]: https://github.com/jamesgober/raft-io/compare/v1.2.0...HEAD
 [1.2.0]: https://github.com/jamesgober/raft-io/compare/v1.1.0...v1.2.0

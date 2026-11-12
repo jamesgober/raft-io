@@ -22,7 +22,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "Raft consensus and replicated-log engine for Rust. Leader election, log replication, membership changes, and snapshotting over a pluggable transport and a pluggable log store. The consensus layer above wal-db and the coordination substrate for Hive DB clustering."
+description = "Raft consensus and replicated-log engine for Rust. Leader election, log replication, membership changes, and snapshotting over a pluggable transport and a pluggable log store. The consensus layer above wal-db and a coordination substrate for database clustering."
 
 # Keywords (5 max)
 keywords = [
