@@ -258,6 +258,10 @@ pub enum Action {
 enum ProgressState {
     Probe,
     Replicate,
+    /// A snapshot has been sent and its reply is awaited. Heartbeats do not
+    /// resend it; it is resent only after [`RaftNode::snapshot_resend_ticks`]
+    /// ticks without a reply.
+    Snapshot,
 }
 
 /// The leader's view of one follower's replication progress.
@@ -274,6 +278,9 @@ struct Progress {
     /// Highest read-confirmation round (`ReadProbe.seq`) this follower has
     /// acknowledged, used to count a quorum for linearizable reads.
     acked_read_seq: u64,
+    /// Ticks since the last `InstallSnapshot` was sent, while in
+    /// [`ProgressState::Snapshot`].
+    snapshot_elapsed: u32,
 }
 
 /// A node in a Raft cluster: the deterministic consensus state machine.
@@ -349,6 +356,10 @@ pub struct RaftNode<L: RaftLog = MemoryLog> {
     /// The target of an in-progress leadership transfer, if any. While set, the
     /// leader declines new proposals so the transfer can complete.
     transfer_target: Option<NodeId>,
+    /// Ticks since the transfer to [`transfer_target`](Self::transfer_target)
+    /// began. A transfer that has not completed within one (maximum) election
+    /// timeout is abandoned, so an unreachable target cannot block writes.
+    transfer_elapsed: u32,
 
     /// Whether this leader's commit index is known to reflect every entry
     /// committed before it took over — true once it has committed an entry of its
@@ -472,6 +483,7 @@ impl<L: RaftLog> RaftNode<L> {
             progress: Vec::new(),
             snapshot_hinted_at: base,
             transfer_target: None,
+            transfer_elapsed: 0,
             read_safe: false,
             read_seq: 0,
             waiting_reads: Vec::new(),
@@ -629,6 +641,13 @@ impl<L: RaftLog> RaftNode<L> {
         self.voters = voters;
         self.learners = learners;
         self.config_index = config_index;
+        // A transfer to a node that is no longer a voter can never complete.
+        if self
+            .transfer_target
+            .is_some_and(|target| !self.voters.contains(&target))
+        {
+            self.transfer_target = None;
+        }
         if self.role == Role::Leader {
             self.rebuild_progress();
         }
@@ -683,6 +702,7 @@ impl<L: RaftLog> RaftNode<L> {
                         match_index: 0,
                         state: ProgressState::Probe,
                         acked_read_seq: 0,
+                        snapshot_elapsed: 0,
                     })
             })
             .collect();
@@ -755,6 +775,21 @@ impl<L: RaftLog> RaftNode<L> {
             }
             Role::Leader => {
                 self.heartbeat_elapsed += 1;
+                // A leadership transfer that has not completed within one
+                // election timeout is abandoned (Raft thesis §3.10): the target
+                // may be down or partitioned, and the leader resumes accepting
+                // writes.
+                if self.transfer_target.is_some() {
+                    self.transfer_elapsed += 1;
+                    if self.transfer_elapsed >= self.election_timeout_max {
+                        self.transfer_target = None;
+                    }
+                }
+                for p in &mut self.progress {
+                    if p.state == ProgressState::Snapshot {
+                        p.snapshot_elapsed = p.snapshot_elapsed.saturating_add(1);
+                    }
+                }
                 if self.heartbeat_elapsed >= self.heartbeat_interval {
                     self.heartbeat_elapsed = 0;
                     self.replicate_to_all(&mut actions);
@@ -874,22 +909,26 @@ impl<L: RaftLog> RaftNode<L> {
         self.rebuild_progress();
 
         // If the new leader's log is fully committed, its commit index is already
-        // accurate and reads are immediately safe. Otherwise it holds an
-        // uncommitted tail of earlier-term entries it cannot prove committed by
-        // replica count alone (§5.4.2); it appends a no-op of its own term — a
-        // configuration entry re-asserting the current membership, which is never
-        // surfaced to the application — so that committing the no-op rides those
-        // entries over the commit line and establishes an accurate commit index
-        // (the ReadIndex bootstrap, Raft thesis §6.4).
-        if self.commit_index == self.log.last_index() {
-            self.read_safe = true;
-        } else {
-            let index = self.log.last_index() + 1;
-            let entry = LogEntry::config(self.current_term, index, &self.voters);
-            self.log.append(core::slice::from_ref(&entry))?;
-            self.log.sync()?;
-            self.config_index = index;
-        }
+        // accurate and reads are immediately safe (leader completeness: every
+        // committed entry is in its log).
+        self.read_safe = self.commit_index == self.log.last_index();
+        // Every new leader appends a no-op of its own term: a configuration
+        // entry re-asserting the current membership, voters and learners both,
+        // which is never surfaced to the application. Committing it rides any
+        // uncommitted earlier-term tail over the commit line (§5.4.2, the
+        // ReadIndex bootstrap of Raft thesis §6.4), and it is what makes
+        // single-server membership changes safe: a leader must commit an entry
+        // of its own term before it may start a configuration change (Ongaro,
+        // raft-dev 2015), because another node may still hold an uncommitted
+        // configuration entry from an earlier term. The no-op is appended even
+        // when the log is fully committed, since that case is exactly the one
+        // the rule exists for.
+        let index = self.log.last_index() + 1;
+        let entry =
+            LogEntry::config_with_learners(self.current_term, index, &self.voters, &self.learners);
+        self.log.append(core::slice::from_ref(&entry))?;
+        self.log.sync()?;
+        self.config_index = index;
 
         // Assert authority at once with an initial round of appends, and
         // (single-node) commit anything outstanding from the current term.
@@ -962,12 +1001,26 @@ impl<L: RaftLog> RaftNode<L> {
         }
     }
 
+    /// Ticks a sent snapshot may go unanswered before it is sent again: two
+    /// maximum election timeouts, so a large snapshot on a slow link is not
+    /// rebuilt and queued again on every heartbeat.
+    fn snapshot_resend_ticks(&self) -> u32 {
+        self.election_timeout_max.saturating_mul(2).max(1)
+    }
+
     /// Sends the current snapshot to peer index `i`. Used when the follower needs
-    /// an entry the leader has already compacted away. Progress stays in `Probe`
-    /// until the reply confirms the install, so it is not advanced here.
+    /// an entry the leader has already compacted away. Progress moves to
+    /// `Snapshot` until the reply confirms the install (or the resend interval
+    /// passes), so heartbeats do not send it again in the meantime.
     fn send_snapshot(&mut self, i: usize, actions: &mut Vec<Action>) {
+        if self.progress[i].state == ProgressState::Snapshot
+            && self.progress[i].snapshot_elapsed < self.snapshot_resend_ticks()
+        {
+            return;
+        }
         if let Some(snapshot) = self.log.snapshot() {
-            self.progress[i].state = ProgressState::Probe;
+            self.progress[i].state = ProgressState::Snapshot;
+            self.progress[i].snapshot_elapsed = 0;
             actions.push(Action::Send {
                 to: self.progress[i].id,
                 message: Message::InstallSnapshot(InstallSnapshot {
@@ -982,10 +1035,13 @@ impl<L: RaftLog> RaftNode<L> {
     // ---- proposals -------------------------------------------------------
 
     fn propose(&mut self, command: Vec<u8>) -> Result<Vec<Action>> {
-        if self.role != Role::Leader || self.transfer_target.is_some() {
+        if self.role != Role::Leader {
             return Err(Error::NotLeader {
                 leader: self.leader_id,
             });
+        }
+        if let Some(target) = self.transfer_target {
+            return Err(Error::TransferInProgress { target });
         }
         let index = self.log.last_index() + 1;
         let entry = LogEntry::new(self.current_term, index, command);
@@ -1002,42 +1058,41 @@ impl<L: RaftLog> RaftNode<L> {
 
     /// Advances the commit index to the highest entry a quorum has stored.
     ///
-    /// Counts, for each candidate index `n`, the leader plus every follower
-    /// whose `match_index` reaches `n`. Raft's safety rule (§5.4.2) is enforced
-    /// strictly: an entry is committed by counting replicas **only if it was
-    /// created in the current term**. Older-term entries ride along once a
-    /// current-term entry above them commits. A single-node cluster commits its
-    /// own current-term tail immediately (quorum of one).
+    /// The highest index a quorum of voters holds is the quorum-th largest
+    /// `match_index` among them (the leader counting its own last index while
+    /// it is a voter), found by sorting at most one value per voter, so a reply
+    /// costs O(voters log voters) however long the uncommitted tail is. Raft's
+    /// safety rule (§5.4.2) is enforced strictly: that index is committed by
+    /// counting replicas **only if its entry was created in the current term**.
+    /// Older-term entries ride along once a current-term entry above them
+    /// commits. Terms never decrease down the log, so if the quorum index holds
+    /// an older term, no lower index holds a current one either. A single-node
+    /// cluster commits its own current-term tail immediately (quorum of one).
     fn advance_commit(&mut self, actions: &mut Vec<Action>) {
         let last = self.log.last_index();
         let quorum = self.quorum();
+        let mut matched: Vec<Index> = Vec::with_capacity(self.voters.len());
         // The leader counts toward a quorum only while it is itself a voter; a
         // leader being removed (no longer a voter) needs a majority of the
         // remaining members before its own removal commits.
-        let leader_holds = usize::from(self.is_voter());
-        let mut new_commit = self.commit_index;
-        let mut n = last;
-        while n > self.commit_index {
-            match self.log.term_at(n) {
-                Some(term) if term == self.current_term => {
-                    let mut replicas = leader_holds;
-                    for p in &self.progress {
-                        // Learners replicate but never count toward the quorum.
-                        if self.voters.contains(&p.id) && p.match_index >= n {
-                            replicas += 1;
-                        }
-                    }
-                    if replicas >= quorum {
-                        new_commit = n;
-                        break; // highest such index found
-                    }
-                }
-                // Terms never decrease down the log; once we pass below the
-                // current term there is no current-term entry left to commit.
-                Some(term) if term < self.current_term => break,
-                _ => {}
+        if self.is_voter() {
+            matched.push(last);
+        }
+        for p in &self.progress {
+            // Learners replicate but never count toward the quorum.
+            if self.voters.contains(&p.id) {
+                matched.push(p.match_index.min(last));
             }
-            n -= 1;
+        }
+        let mut new_commit = self.commit_index;
+        if quorum > 0 && matched.len() >= quorum {
+            matched.sort_unstable_by(|a, b| b.cmp(a));
+            let candidate = matched[quorum - 1];
+            if candidate > self.commit_index
+                && self.log.term_at(candidate) == Some(self.current_term)
+            {
+                new_commit = candidate;
+            }
         }
         if new_commit > self.commit_index {
             self.commit_index = new_commit;
@@ -1292,7 +1347,11 @@ impl<L: RaftLog> RaftNode<L> {
         if self.role != Role::Candidate || reply.term != self.current_term {
             return Ok(());
         }
-        if reply.vote_granted && !self.votes.contains(&reply.from) {
+        // Only a voter's grant counts toward the election quorum.
+        if reply.vote_granted
+            && self.voters.contains(&reply.from)
+            && !self.votes.contains(&reply.from)
+        {
             self.votes.push(reply.from);
             if self.votes.len() >= self.quorum() {
                 self.become_leader(actions)?;
@@ -1340,7 +1399,10 @@ impl<L: RaftLog> RaftNode<L> {
             self.pre_votes.clear();
             return self.become_follower(reply.term, None);
         }
-        if reply.vote_granted && !self.pre_votes.contains(&reply.from) {
+        if reply.vote_granted
+            && self.voters.contains(&reply.from)
+            && !self.pre_votes.contains(&reply.from)
+        {
             self.pre_votes.push(reply.from);
             if self.pre_votes.len() >= self.quorum() {
                 self.start_election(false, actions)?;
@@ -1514,6 +1576,14 @@ impl<L: RaftLog> RaftNode<L> {
             return Ok(());
         }
 
+        // A correct leader never sends a batch that is not contiguous after
+        // `prev_log_index`, whose terms run backwards or above its own term, or
+        // that would overwrite a committed entry. Such a message comes from a
+        // faulty or misrouted peer: drop it without acting on any of it.
+        if !self.append_is_well_formed(&ae) {
+            return Ok(());
+        }
+
         // A valid leader for our term: accept its authority and reset the timer.
         // Recognising a leader ends any pre-vote round in progress.
         self.role = Role::Follower;
@@ -1528,8 +1598,11 @@ impl<L: RaftLog> RaftNode<L> {
         // leader resend the tail with a `prev` we can check.
         let base = self.log.snapshot_index();
         if ae.prev_log_index < base {
-            if ae.leader_commit > self.commit_index {
-                self.commit_index = ae.leader_commit.min(base);
+            // `commit_index` never moves backwards (it is already at least
+            // `base`, so this can only raise it).
+            let commit = ae.leader_commit.min(base);
+            if commit > self.commit_index {
+                self.commit_index = commit;
                 self.drain_applies(actions);
             }
             reply.success = true;
@@ -1577,9 +1650,12 @@ impl<L: RaftLog> RaftNode<L> {
             self.refresh_config(actions);
         }
 
-        if ae.leader_commit > self.commit_index {
-            // Never commit past the last entry this RPC actually covers.
-            self.commit_index = ae.leader_commit.min(match_index);
+        // Never commit past the last entry this RPC actually covers, and never
+        // move the commit index backwards: a reordered or duplicated RPC that
+        // covers less than we already committed leaves it where it is.
+        let commit = ae.leader_commit.min(match_index);
+        if commit > self.commit_index {
+            self.commit_index = commit;
             self.drain_applies(actions);
         }
 
@@ -1590,6 +1666,36 @@ impl<L: RaftLog> RaftNode<L> {
             message: Message::AppendEntriesReply(reply),
         });
         Ok(())
+    }
+
+    /// Defence-in-depth checks on a current-term `AppendEntries`: the entries
+    /// are contiguous from `prev_log_index + 1`, their terms never decrease,
+    /// never fall below `prev_log_term` and never exceed the RPC's term, and
+    /// the first entry that conflicts with our log (where a truncation would
+    /// start) lies above our commit index.
+    fn append_is_well_formed(&self, ae: &AppendEntries) -> bool {
+        let mut prev_term = ae.prev_log_term;
+        for (k, entry) in ae.entries.iter().enumerate() {
+            let expected = ae
+                .prev_log_index
+                .checked_add(k as Index + 1)
+                .unwrap_or(Index::MAX);
+            if entry.index != expected || entry.term < prev_term || entry.term > ae.term {
+                return false;
+            }
+            prev_term = entry.term;
+        }
+        if ae.prev_log_term > ae.term {
+            return false;
+        }
+        for entry in &ae.entries {
+            match self.log.term_at(entry.index) {
+                Some(term) if term == entry.term => {}
+                Some(_) => return entry.index > self.commit_index,
+                None => break,
+            }
+        }
+        true
     }
 
     /// Reconciles the leader's entries into the follower's log.
@@ -1632,6 +1738,11 @@ impl<L: RaftLog> RaftNode<L> {
         };
 
         if reply.success {
+            // A follower cannot hold more than we have sent it; a larger claim
+            // comes from a faulty peer and is ignored.
+            if reply.match_index > self.log.last_index() {
+                return;
+            }
             // match_index only ever advances, tolerating reordered duplicates.
             if reply.match_index > self.progress[i].match_index {
                 self.progress[i].match_index = reply.match_index;
@@ -1650,6 +1761,12 @@ impl<L: RaftLog> RaftNode<L> {
                 self.send_append(i, actions);
             }
         } else {
+            // A rejection of an append sent before the snapshot says nothing
+            // the pending snapshot does not already cover: wait for its reply
+            // rather than sending the snapshot again.
+            if self.progress[i].state == ProgressState::Snapshot {
+                return;
+            }
             // Rejected: backtrack next_index using the follower's conflict hint,
             // drop to Probe, and retry at once.
             let next = self.progress[i].next_index;
@@ -1692,8 +1809,12 @@ impl<L: RaftLog> RaftNode<L> {
         // Install only if the snapshot advances us beyond what we already hold: a
         // follower that has caught up further via normal replication, or that
         // holds a newer snapshot, must not be dragged backwards by a stale or
-        // reordered `InstallSnapshot`.
-        if snap_index > self.log.snapshot_index() && snap_index > self.commit_index {
+        // reordered `InstallSnapshot`. Both indexes are monotonic, so a
+        // snapshot at or below either is older than the state we have.
+        if snap_index > self.log.snapshot_index()
+            && snap_index > self.commit_index
+            && snap_index > self.last_applied
+        {
             // Adopt the configuration the snapshot carries before installing it,
             // so a node catching up this way knows the membership (voters and
             // learners both).
@@ -1747,6 +1868,10 @@ impl<L: RaftLog> RaftNode<L> {
         let Some(i) = self.progress_index(reply.from) else {
             return;
         };
+        // A follower cannot have installed more than we hold.
+        if reply.last_index > self.log.last_index() {
+            return;
+        }
         if reply.last_index > self.progress[i].match_index {
             self.progress[i].match_index = reply.last_index;
         }
@@ -1815,12 +1940,24 @@ impl<L: RaftLog> RaftNode<L> {
     /// is still uncommitted is rejected with [`Error::ConfigInProgress`]. A change
     /// that leaves both sets unchanged is a no-op and appends nothing.
     fn reconfigure(&mut self, voters: Vec<NodeId>, learners: Vec<NodeId>) -> Result<Vec<Action>> {
-        if self.role != Role::Leader || self.transfer_target.is_some() {
+        if self.role != Role::Leader {
             return Err(Error::NotLeader {
                 leader: self.leader_id,
             });
         }
-        // The previous configuration change must have committed first.
+        if let Some(target) = self.transfer_target {
+            return Err(Error::TransferInProgress { target });
+        }
+        // A new leader must commit an entry of its own term (its election
+        // no-op) before it changes the configuration: until then another node
+        // may hold an uncommitted configuration entry from an earlier term, and
+        // a change based on the old configuration could commit a different
+        // entry at the same index (the single-server membership-change rule).
+        if self.log.term_at(self.commit_index) != Some(self.current_term) {
+            return Err(Error::ConfigInProgress);
+        }
+        // Only one configuration change may be uncommitted at a time: the
+        // previous one (or the election no-op) must have committed first.
         if self.config_index > self.commit_index {
             return Err(Error::ConfigInProgress);
         }
@@ -1901,6 +2038,7 @@ impl<L: RaftLog> RaftNode<L> {
             return Ok(Vec::new());
         }
         self.transfer_target = Some(target);
+        self.transfer_elapsed = 0;
         let mut actions = Vec::new();
         // If the target is already caught up, hand off now; otherwise bring it up
         // to date and the catch-up replies will trigger the hand-off.
@@ -1994,9 +2132,10 @@ mod tests {
     fn test_single_node_commits_proposal() {
         let mut node = RaftNode::new(RaftConfig::single(1));
         drive_to_leader(&mut node);
+        // The election no-op is index 1; the proposal is index 2.
         let actions = node.step(Event::Propose(b"a".to_vec())).unwrap();
-        assert_eq!(node.commit_index(), 1);
-        assert_eq!(node.last_applied(), 1);
+        assert_eq!(node.commit_index(), 2);
+        assert_eq!(node.last_applied(), 2);
         let applied: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, Action::Apply { .. }))
@@ -2245,6 +2384,21 @@ mod tests {
             )))
             .expect("vote reply");
         assert_eq!(node.role(), Role::Leader);
+        // Follower 2 acknowledges the election no-op (index 1), so the leader
+        // has committed an entry of its own term and may reconfigure.
+        let _ = node
+            .step(Event::Message(Message::AppendEntriesReply(
+                AppendEntriesReply {
+                    term,
+                    success: true,
+                    from: 2,
+                    match_index: 1,
+                    conflict_index: 0,
+                    conflict_term: 0,
+                },
+            )))
+            .expect("no-op ack");
+        assert_eq!(node.commit_index(), 1);
         node
     }
 
@@ -2340,38 +2494,39 @@ mod tests {
                     term: node.term(),
                     success: true,
                     from: 2,
-                    match_index: 0,
-                    conflict_index: 0,
-                    conflict_term: 0,
-                },
-            )))
-            .unwrap();
-
-        // Propose: the entry streams to follower 2 but is not yet committed.
-        let actions = node.step(Event::Propose(b"x".to_vec())).unwrap();
-        assert_eq!(node.commit_index(), 0);
-        let ae = first_append_entries(&actions, 2);
-        assert_eq!(ae.entries.len(), 1);
-        assert_eq!(ae.entries[0].index, 1);
-
-        // Follower 2 acknowledges index 1: quorum reached, entry commits/applies.
-        let applied = node
-            .step(Event::Message(Message::AppendEntriesReply(
-                AppendEntriesReply {
-                    term: node.term(),
-                    success: true,
-                    from: 2,
                     match_index: 1,
                     conflict_index: 0,
                     conflict_term: 0,
                 },
             )))
             .unwrap();
+
+        // Propose: the entry (index 2, after the election no-op) streams to
+        // follower 2 but is not yet committed.
+        let actions = node.step(Event::Propose(b"x".to_vec())).unwrap();
         assert_eq!(node.commit_index(), 1);
+        let ae = first_append_entries(&actions, 2);
+        assert_eq!(ae.entries.len(), 1);
+        assert_eq!(ae.entries[0].index, 2);
+
+        // Follower 2 acknowledges index 2: quorum reached, entry commits/applies.
+        let applied = node
+            .step(Event::Message(Message::AppendEntriesReply(
+                AppendEntriesReply {
+                    term: node.term(),
+                    success: true,
+                    from: 2,
+                    match_index: 2,
+                    conflict_index: 0,
+                    conflict_term: 0,
+                },
+            )))
+            .unwrap();
+        assert_eq!(node.commit_index(), 2);
         assert!(
             applied
                 .iter()
-                .any(|a| matches!(a, Action::Apply { index: 1, .. }))
+                .any(|a| matches!(a, Action::Apply { index: 2, .. }))
         );
     }
 
@@ -3028,11 +3183,12 @@ mod tests {
         drive_to_leader(&mut node);
         let _ = node.step(Event::Propose(b"a".to_vec())).unwrap();
         let _ = node.step(Event::Propose(b"b".to_vec())).unwrap();
-        assert_eq!(node.commit_index(), 2);
+        // Index 1 is the election no-op.
+        assert_eq!(node.commit_index(), 3);
         // A lone leader is its own quorum, so the read is ready at once, at the
         // index covering both committed writes.
         let actions = node.step(Event::Read { id: 42 }).unwrap();
-        assert_eq!(read_ready(&actions, 42), Some(2));
+        assert_eq!(read_ready(&actions, 42), Some(3));
     }
 
     #[test]

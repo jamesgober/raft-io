@@ -29,7 +29,7 @@
     <br>
     <hr>
     <p>
-        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Deterministic sans-I/O core. Pluggable transport + log store. Provable safety properties.
+        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Deterministic sans-I/O core. Pluggable log store, transport-agnostic. Provable safety properties.
     </p>
     <blockquote>
         <strong>Status: <code>1.0</code> &mdash; stable.</strong> The protocol is complete; the public API, the wire format, and the durable log format are frozen and will not change incompatibly before <code>2.0</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
@@ -44,7 +44,7 @@
 - **Leader election** &mdash; randomized-timeout election with term and vote safety and pre-vote disruption protection; one leader per term
 - **Log replication** &mdash; batched append-entries with per-follower progress, optimistic pipelining, conflict-hint backtracking, and commit on a quorum
 - **Deterministic core** &mdash; the state machine is pure and step-driven, so the whole protocol is testable without time or I/O
-- **Pluggable transport** &mdash; `RaftTransport` trait; in-memory for tests, real net for production
+- **Transport-agnostic** &mdash; the node returns `Action::Send` and your driver delivers it (optionally behind the `RaftTransport` trait; `MemoryTransport` records messages for tests)
 - **Pluggable log store** &mdash; `RaftLog` trait; `wal-db`-backed `WalLog` under the `persistence` feature
 - **Crash recovery** &mdash; term, vote, and log persisted before each RPC; a restarted node recovers and rejoins without violating safety
 - **Snapshotting** &mdash; install-snapshot for log compaction and fast follower catch-up, driven by a snapshot-policy hint
@@ -90,11 +90,11 @@ assert_eq!(node.leader(), Some(1));
 for action in node.step(Event::Propose(b"set x = 1".to_vec())).unwrap() {
     if let Action::Apply { index, command, .. } = action {
         // hand `command` to your state machine, in log order
-        assert_eq!(index, 1);
+        assert_eq!(index, 2); // index 1 is the leader's election no-op
         assert_eq!(command, b"set x = 1");
     }
 }
-assert_eq!(node.commit_index(), 1);
+assert_eq!(node.commit_index(), 2);
 ```
 
 A multi-node cluster works the same way: you route each `Action::Send` to the

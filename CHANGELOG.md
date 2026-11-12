@@ -11,6 +11,85 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.2.0] - 2026-11-12
+
+Safety fixes from the 2026-11 independent review. Upgrade every node.
+
+### Fixed
+
+- **Membership changes wait for a commit in the leader's own term.** A newly
+  elected leader whose log was fully committed could start a single-server
+  configuration change at once, while another node still held an uncommitted
+  change from an earlier term; in rare schedules two different entries could
+  then be committed at one index. Every leader now appends its election no-op
+  (previously only when it held an uncommitted tail), and a configuration
+  change returns `ConfigInProgress` until an entry of the leader's term has
+  committed, normally one round trip after election.
+- **The election no-op keeps learners.** It carried the voters only, so every
+  node that appended it dropped the learner set, and learners stopped
+  receiving entries after the next leader change.
+- **Commit and applied indexes never move backwards.** A reordered or
+  duplicated `AppendEntries` covering less than a follower had committed
+  lowered its commit index, after which an older `InstallSnapshot` could roll
+  applied state back and re-emit `Apply` for entries already applied.
+- **Leadership transfer is bounded.** A transfer to a node that never catches
+  up (down or partitioned) used to block proposals and membership changes
+  until the leader lost its role. It is now abandoned after one maximum
+  election timeout, or when the target stops being a voter.
+- **`WalLog` compacts on snapshot.** The docs promised a bounded file, but the
+  single-file WAL never dropped anything. Installing a snapshot now rewrites
+  the file as the snapshot, the live tail and the hard state (via
+  `<path>.compact` and a rename), so disk use and restart time follow the live
+  state, not the history. The record format is unchanged.
+- **Snapshots are not resent on every heartbeat.** After sending a snapshot
+  the leader waits for the reply, resending only after two maximum election
+  timeouts.
+- **Peer messages are checked before they are trusted.** Replies claiming more
+  than the leader holds, vote and pre-vote grants from non-voters, and appends
+  that are not contiguous, carry a term above the RPC's, or would overwrite a
+  committed entry are ignored.
+- `framing::decode` accepts only the canonical encoding, as
+  `docs/PROTOCOL.md` §8 always stated.
+
+### Added
+
+- `Error::TransferInProgress { target }`: returned by proposals and
+  membership changes during a leadership transfer (previously `NotLeader`
+  naming the leader itself). Retryable.
+- `framing::decode_limit` and `framing::decode_with_config`.
+- `tests/regressions.rs` (deterministic schedules for each fix) and
+  `tests/simulation.rs` (a seeded cluster simulation with crash-restart on a
+  lossy log, partitions, loss, reordering, duplication, membership churn
+  including an isolated leader holding an uncommitted change, transfers,
+  snapshots and reads, checking state machine safety and monotonic commit and
+  apply indexes).
+
+### Changed
+
+- `pack-io` (feature `framing`) moves to `2.1`. `framing::decode` decodes under
+  pack-io's network preset (16 MiB), widened to twice the frame length for
+  larger frames, so decode memory is bounded relative to the frame while large
+  snapshots still decode.
+- Commit advancement selects the quorum index from the voters' match indexes
+  instead of walking the uncommitted tail.
+- Every new leader writes one extra entry (the no-op) at election, so the
+  first entry a new cluster applies is index 2. Applied indexes were already
+  documented as strictly increasing but not contiguous.
+- Docs: `RaftTransport` is described as the optional helper it is (the node
+  returns `Action::Send` and never calls it); `docs/PROTOCOL.md` §5 to §9 and
+  §11 state the rules above.
+
+### Upgrading
+
+No wire or disk format changes: the no-op is an ordinary configuration entry
+(byte-identical to 1.1 when there are no learners, and carrying the learner
+section 1.0 and 1.1 already decode when there are), and `WalLog` files written
+by 1.0 and 1.1 open unchanged. A rolling upgrade works. The membership fix
+protects a term only when its leader runs 1.2, so finish the upgrade before
+making membership changes, or make them only while a 1.2 node leads.
+
+---
+
 ## [1.1.0] - 2026-11-11
 
 ### Security
@@ -444,7 +523,8 @@ Initial scaffold and repository bootstrap. No raft-io logic yet &mdash; this rel
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/raft-io/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/jamesgober/raft-io/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/jamesgober/raft-io/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/jamesgober/raft-io/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/raft-io/compare/v0.10.1...v1.0.0
 [0.10.1]: https://github.com/jamesgober/raft-io/compare/v0.10.0...v0.10.1

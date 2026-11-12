@@ -89,13 +89,28 @@ pub enum Error {
         detail: String,
     },
 
-    /// A membership change was requested while a previous one is still in flight.
+    /// A membership change was requested while a previous one is still in flight,
+    /// or before a newly elected leader has committed an entry of its own term.
     ///
     /// Raft changes the configuration one server at a time, and the leader must
     /// not begin a new change until the previous configuration entry has
-    /// committed. Retry once the in-flight change completes. This is a routine,
-    /// retryable condition.
+    /// committed. A new leader must also commit its election no-op first, which
+    /// normally takes one round trip to a quorum. Retry once the in-flight
+    /// change completes. This is a routine, retryable condition.
     ConfigInProgress,
+
+    /// The leader is handing leadership to `target` and declines proposals and
+    /// membership changes until the hand-off completes.
+    ///
+    /// The transfer either completes (this node steps down; retry against the
+    /// new leader) or is abandoned after one election timeout (this node
+    /// accepts requests again). This is a routine, retryable condition. Before
+    /// 1.2.0 this case was reported as [`NotLeader`](Error::NotLeader) naming
+    /// this node.
+    TransferInProgress {
+        /// The node leadership is being transferred to.
+        target: NodeId,
+    },
 }
 
 impl fmt::Display for Error {
@@ -116,6 +131,9 @@ impl fmt::Display for Error {
             Self::ConfigInProgress => {
                 write!(f, "a configuration change is already in progress")
             }
+            Self::TransferInProgress { target } => {
+                write!(f, "a leadership transfer to node {target} is in progress")
+            }
         }
     }
 }
@@ -129,6 +147,7 @@ impl ForgeError for Error {
             Self::Storage { .. } => "Storage",
             Self::Encoding { .. } => "Encoding",
             Self::ConfigInProgress => "ConfigInProgress",
+            Self::TransferInProgress { .. } => "TransferInProgress",
         }
     }
 
@@ -138,14 +157,19 @@ impl ForgeError for Error {
             Self::Storage { .. } => "Log storage failure",
             Self::Encoding { .. } => "Message framing failure",
             Self::ConfigInProgress => "Configuration change in progress",
+            Self::TransferInProgress { .. } => "Leadership transfer in progress",
         }
     }
 
-    /// A `NotLeader` rejection is retryable against the indicated leader and a
-    /// `ConfigInProgress` rejection is retryable once the change completes; a
-    /// storage failure on the durability path is not.
+    /// A `NotLeader` rejection is retryable against the indicated leader, and
+    /// `ConfigInProgress` / `TransferInProgress` rejections are retryable once
+    /// the change or hand-off completes; a storage failure on the durability
+    /// path is not.
     fn is_retryable(&self) -> bool {
-        matches!(self, Self::NotLeader { .. } | Self::ConfigInProgress)
+        matches!(
+            self,
+            Self::NotLeader { .. } | Self::ConfigInProgress | Self::TransferInProgress { .. }
+        )
     }
 
     /// A storage failure means the node can no longer guarantee durability and
