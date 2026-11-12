@@ -24,7 +24,7 @@
         Most Rust Raft crates either bolt the protocol to a specific runtime and transport, or stay so abstract they ship no usable storage. <code>raft-io</code> separates the <b>protocol</b> (deterministic, sans-I/O) from the <b>drivers</b> (transport, log store, clock), ships a real <code>wal-db</code>-backed log under a feature flag, and keeps the common single-node-test path trivial.
     </p>
     <p>
-        It is the coordination layer for Hive DB clustering, and it sits directly on top of <code>wal-db</code> for durable log persistence.
+        It is a coordination layer for database clustering, and it sits directly on top of <code>wal-db</code> for durable log persistence.
     </p>
     <br>
     <hr>
@@ -146,7 +146,6 @@ performance baselines in <a href="./docs/BENCHMARKS.md"><code>docs/BENCHMARKS.md
 
 - [`wal-db`](https://github.com/jamesgober/wal-db) &mdash; durable Raft log persistence (under `persistence`)
 - [`pack-io`](https://github.com/jamesgober/pack-io) &mdash; typed RPC message framing (under `framing`)
-- Hive DB &mdash; cluster coordination and replicated metadata
 
 It stays foreign-compatible: usable standalone in any system that needs replicated, fault-tolerant state.
 
